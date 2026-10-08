@@ -1,3 +1,3 @@
-- Fixed openWakeWord setup on Linux with Python 3.12, including NVIDIA Blackwell trainers, by keeping the Tater training path ONNX-only instead of requiring an unavailable TFLite runtime.
-- Added explicit portable dependencies for ONNX training and verifier calibration.
-- Added separate calibrated thresholds for standalone openWakeWord detection and lower-latency dual-model confirmation, preserving genuine wake-word recall without weakening standalone filtering.
+- Streamed false-positive validation data from disk in bounded batches instead of constructing one multi-gigabyte tensor, preventing Apple MPS out-of-memory failures and reducing peak memory use on every backend.
+- Added configurable negative-training and validation batch sizes so resource-constrained trainers can use safer defaults without reducing NVIDIA throughput.
+- Made `OWW_FORCE_CPU=1` an end-to-end training option when GPU or MPS execution needs to be disabled.
