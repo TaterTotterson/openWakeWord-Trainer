@@ -255,7 +255,12 @@ else
 fi
 
 "$PY" scripts/patch_piper_generator.py "$PIPER_DIR"
-"$PY" -m pip install -e "$OPENWAKEWORD_DIR"
+# The Linux PyPI metadata for openwakeword requires tflite-runtime even when
+# only its ONNX training/export path is used.  Python 3.12 (including the
+# Blackwell image) has no matching tflite-runtime wheel, so install the
+# vendored source without resolving that unused backend.  Every dependency
+# needed by Tater's ONNX path is installed explicitly above.
+"$PY" -m pip install --no-build-isolation --no-deps -e "$OPENWAKEWORD_DIR"
 if ! "$PY" -m pip install -e "$PIPER_DIR"; then
   echo "WARNING: editable piper-sample-generator install failed; retrying vendored fork without dependency resolution"
   "$PY" -m pip install --no-build-isolation --force-reinstall --no-deps -e "$PIPER_DIR"
