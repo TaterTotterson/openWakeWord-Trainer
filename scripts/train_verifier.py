@@ -31,11 +31,13 @@ def main() -> int:
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
+    base_model = Path(args.base_model).expanduser().resolve()
     trainer(
         positive_reference_clips=positive_clips,
         negative_reference_clips=negative_clips,
         output_path=str(output),
-        model_name=Path(args.base_model).name,
+        model_name=str(base_model),
+        inference_framework="onnx",
     )
     print(f"Saved verifier: {output}", flush=True)
     return 0
