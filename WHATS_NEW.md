@@ -1,3 +1,2 @@
-- Streamed false-positive validation data from disk in bounded batches instead of constructing one multi-gigabyte tensor, preventing Apple MPS out-of-memory failures and reducing peak memory use on every backend.
-- Added configurable negative-training and validation batch sizes so resource-constrained trainers can use safer defaults without reducing NVIDIA throughput.
-- Made `OWW_FORCE_CPU=1` an end-to-end training option when GPU or MPS execution needs to be disabled.
+- Fixed personalized verifier training to load the generated wake-word model by its full path and explicitly use ONNX Runtime.
+- Removed the erroneous LiteRT dependency error that appeared after otherwise successful Apple Silicon and NVIDIA/Blackwell training runs.
