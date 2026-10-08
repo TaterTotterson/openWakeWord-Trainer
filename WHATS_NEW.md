@@ -1,0 +1,3 @@
+- Fixed openWakeWord setup on Linux with Python 3.12, including NVIDIA Blackwell trainers, by keeping the Tater training path ONNX-only instead of requiring an unavailable TFLite runtime.
+- Added explicit portable dependencies for ONNX training and verifier calibration.
+- Added separate calibrated thresholds for standalone openWakeWord detection and lower-latency dual-model confirmation, preserving genuine wake-word recall without weakening standalone filtering.
