@@ -140,7 +140,7 @@ If training fails with `Unexpected bus error encountered in worker`, Docker's sh
 
 ## Apple Silicon Notes
 
-Native Apple training is supported as a best-effort path. It uses the same scripts, creates `.venv`, installs the Python stack, and runs the upstream openWakeWord trainer. The launcher patches the vendored trainer so PyTorch selects Apple MPS when available, and Piper sample generation now uses `OWW_PIPER_DEVICE=auto` so it prefers CUDA/MPS before falling back to CPU. Set `OWW_ENABLE_MPS=0`, `OWW_PIPER_DEVICE=cpu`, or enable `force CPU` in the UI if an operation falls back poorly.
+Native Apple training is supported as a best-effort path. It uses the same scripts, creates `.venv`, installs the Python stack, and runs the upstream openWakeWord trainer. The launcher patches the vendored trainer so PyTorch selects Apple MPS when available, streams false-positive validation data in bounded batches instead of creating one multi-gigabyte MPS tensor, and lets `OWW_DEFAULT_NEGATIVE_BATCH` reduce the normal training batch on unified-memory Macs. Piper sample generation uses `OWW_PIPER_DEVICE=auto` so it prefers CUDA/MPS before falling back to CPU. Set `OWW_FORCE_CPU=1`, `OWW_ENABLE_MPS=0`, `OWW_PIPER_DEVICE=cpu`, or enable `force CPU` in the UI if an operation falls back poorly.
 
 Because upstream automated training historically targeted Linux/Piper, NVIDIA Docker is still the recommended path for the big final run.
 

@@ -13,6 +13,8 @@ Common options are passed through to scripts/train_openwakeword.py:
   --samples 20000
   --validation-samples 2000
   --steps 50000
+  --negative-batch 1024
+  --validation-batch-size 2048
   --negative-tts-batch-divisor 7
   --custom-negative-phrase "phrase"
   --train-verifier
@@ -23,6 +25,8 @@ Environment:
   OWW_DOWNLOAD_RIRS=1|0             default: 1
   OWW_PIPER_DEVICE=auto|mps|cuda|cpu default: auto
   OWW_NEGATIVE_TTS_DIVISOR=7        lower is faster but uses more memory
+  OWW_DEFAULT_NEGATIVE_BATCH=1024    negative features per training step
+  OWW_DEFAULT_VALIDATION_BATCH=2048  false-positive windows evaluated at once
   OWW_FORCE_CPU=1                   disable CUDA/MPS visibility
   OWW_DATA_DIR=/data                persistent Docker data root
   OWW_TORCH_CUDA=cu124              install CUDA PyTorch wheels in the training venv

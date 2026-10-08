@@ -68,6 +68,49 @@ TRAIN_LOADER_PATCHED_LEGACY = '''        n_cpus = os.cpu_count()
         X_train = torch.utils.data.DataLoader(IterDataset(batch_generator),
                                               **train_loader_kwargs)'''
 
+VALIDATION_LOADER_ORIGINAL = '''        X_val_fp = np.load(config["false_positive_validation_data_path"])
+        X_val_fp = np.array([X_val_fp[i:i+input_shape[0]] for i in range(0, X_val_fp.shape[0]-input_shape[0], 1)])  # reshape to match model
+        X_val_fp_labels = np.zeros(X_val_fp.shape[0]).astype(np.float32)
+        X_val_fp = torch.utils.data.DataLoader(
+            torch.utils.data.TensorDataset(torch.from_numpy(X_val_fp), torch.from_numpy(X_val_fp_labels)),
+            batch_size=len(X_val_fp_labels)
+        )'''
+VALIDATION_LOADER_PATCHED = '''        class FalsePositiveValidationDataset(torch.utils.data.IterableDataset):
+            def __init__(self, features, window_size, batch_size):
+                self.features = features
+                self.window_size = window_size
+                self.batch_size = batch_size
+
+            def __iter__(self):
+                n_windows = max(0, self.features.shape[0] - self.window_size)
+                for start in range(0, n_windows, self.batch_size):
+                    stop = min(n_windows, start + self.batch_size)
+                    source = self.features[start:stop+self.window_size-1]
+                    windows = np.lib.stride_tricks.sliding_window_view(
+                        source,
+                        window_shape=self.window_size,
+                        axis=0,
+                    ).swapaxes(1, 2)
+                    # Copy only this bounded batch from the memory-mapped
+                    # source. The original implementation expanded every
+                    # overlapping window into a multi-gigabyte array.
+                    windows = np.array(windows, dtype=np.float32, copy=True)
+                    yield (
+                        torch.from_numpy(windows),
+                        torch.zeros(windows.shape[0], dtype=torch.float32),
+                    )
+
+        X_val_fp_source = np.load(config["false_positive_validation_data_path"], mmap_mode="r")
+        X_val_fp = torch.utils.data.DataLoader(
+            FalsePositiveValidationDataset(
+                X_val_fp_source,
+                input_shape[0],
+                max(1, int(config.get("validation_batch_size", 2048))),
+            ),
+            batch_size=None,
+            num_workers=0,
+        )'''
+
 RESAMPLE_ORIGINAL = '''            if clip_sr != sr:
                 raise ValueError("Error! Clip does not have the correct sample rate!")'''
 RESAMPLE_PATCHED = '''            if clip_sr != sr:
@@ -177,6 +220,15 @@ def main() -> int:
         text = text.replace(TRAIN_LOADER_ORIGINAL, TRAIN_LOADER_PATCHED)
         changed = True
         print(f"Patched openWakeWord training DataLoader workers for macOS spawn: {train_py}", flush=True)
+
+    if "FalsePositiveValidationDataset" in text:
+        print(f"Memory-safe validation loader patch already present: {train_py}", flush=True)
+    else:
+        if VALIDATION_LOADER_ORIGINAL not in text:
+            raise SystemExit(f"Could not find upstream false-positive validation loader in {train_py}")
+        text = text.replace(VALIDATION_LOADER_ORIGINAL, VALIDATION_LOADER_PATCHED)
+        changed = True
+        print(f"Patched openWakeWord validation loader to stream bounded batches: {train_py}", flush=True)
 
     if changed:
         train_py.write_text(text, encoding="utf-8")

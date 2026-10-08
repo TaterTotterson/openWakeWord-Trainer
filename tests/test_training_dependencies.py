@@ -17,6 +17,15 @@ class TrainingDependencyTests(unittest.TestCase):
             launcher,
         )
 
+    def test_upstream_patch_streams_false_positive_validation_batches(self) -> None:
+        patcher = (ROOT / "scripts" / "patch_openwakeword_device.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("FalsePositiveValidationDataset", patcher)
+        self.assertIn('mmap_mode="r"', patcher)
+        self.assertIn('config.get("validation_batch_size", 2048)', patcher)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -93,6 +93,7 @@ def make_config(args: argparse.Namespace, model_name: str, output_dir: Path) -> 
         "background_paths": background_paths,
         "background_paths_duplication_rate": [1 for _ in background_paths],
         "false_positive_validation_data_path": str(validation),
+        "validation_batch_size": args.validation_batch_size,
         "augmentation_rounds": args.augmentation_rounds,
         "feature_data_files": feature_data_files,
         "batch_n_per_class": batch_n_per_class,
@@ -294,7 +295,17 @@ def main() -> int:
     parser.add_argument("--augmentation-rounds", type=int, default=1)
     parser.add_argument("--positive-batch", type=int, default=50)
     parser.add_argument("--adversarial-batch", type=int, default=50)
-    parser.add_argument("--negative-batch", type=int, default=1024)
+    parser.add_argument(
+        "--negative-batch",
+        type=int,
+        default=int(os.environ.get("OWW_DEFAULT_NEGATIVE_BATCH", "1024")),
+    )
+    parser.add_argument(
+        "--validation-batch-size",
+        type=int,
+        default=int(os.environ.get("OWW_DEFAULT_VALIDATION_BATCH", "2048")),
+        help="Number of false-positive validation windows evaluated at once.",
+    )
     parser.add_argument("--model-type", choices=("dnn", "rnn"), default="dnn")
     parser.add_argument("--layer-size", type=int, default=32)
     parser.add_argument("--target-accuracy", type=float, default=0.7)
@@ -326,11 +337,19 @@ def main() -> int:
     parser.add_argument("--calibration-positive-limit", type=int, default=int(os.environ.get("OWW_CALIBRATION_POSITIVE_LIMIT", "200")))
     parser.add_argument("--calibration-negative-limit", type=int, default=int(os.environ.get("OWW_CALIBRATION_NEGATIVE_LIMIT", "500")))
     parser.add_argument("--calibration-patience", type=int, default=int(os.environ.get("OWW_CALIBRATION_PATIENCE", "3")))
-    parser.add_argument("--force-cpu", action="store_true")
+    parser.add_argument(
+        "--force-cpu",
+        action="store_true",
+        default=os.environ.get("OWW_FORCE_CPU", "0").strip().lower() in {"1", "true", "yes", "on"},
+    )
     parser.add_argument("--train-verifier", action="store_true")
     args = parser.parse_args()
     if args.negative_tts_batch_divisor < 1:
         raise SystemExit("--negative-tts-batch-divisor must be 1 or greater")
+    if args.negative_batch < 1:
+        raise SystemExit("--negative-batch must be 1 or greater")
+    if args.validation_batch_size < 1:
+        raise SystemExit("--validation-batch-size must be 1 or greater")
 
     model_name = safe_name(args.model_name or args.phrase)
     output_dir = Path(args.output_root).resolve() / model_name
