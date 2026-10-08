@@ -212,6 +212,31 @@ def choose_threshold(
     return float(fallback_threshold), "no_threshold_met_false_positive_target"
 
 
+def choose_confirmation_threshold(
+    metrics: list[dict[str, Any]],
+    *,
+    min_positive_recall: float,
+    fallback_threshold: float,
+) -> tuple[float, str]:
+    """Choose OWW's less-conservative threshold after an MWW candidate.
+
+    A standalone detector must constrain false wakes itself. A confirmation
+    detector has already been gated by MWW, so reusing the standalone policy
+    can needlessly reject genuine speech. Choose the highest threshold that
+    still preserves the requested positive recall.
+    """
+    candidates = [
+        row
+        for row in metrics
+        if row.get("positive_recall") is not None
+        and float(row.get("positive_recall") or 0.0) >= min_positive_recall
+    ]
+    if candidates:
+        selected = max(candidates, key=lambda row: float(row.get("threshold") or 0.0))
+        return float(selected["threshold"]), "meets_dual_confirmation_recall_target"
+    return float(fallback_threshold), "no_threshold_met_dual_confirmation_recall_target"
+
+
 def trim_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     compact: list[dict[str, Any]] = []
     for row in rows:
@@ -254,6 +279,8 @@ def main() -> int:
     parser.add_argument("--max-false-positive-rate", type=float, default=0.0)
     parser.add_argument("--min-positive-recall", type=float, default=0.70)
     parser.add_argument("--fallback-threshold", type=float, default=0.95)
+    parser.add_argument("--confirmation-min-positive-recall", type=float, default=0.80)
+    parser.add_argument("--confirmation-fallback-threshold", type=float, default=0.90)
     parser.add_argument("--output")
     parser.add_argument("--metadata-json")
     args = parser.parse_args()
@@ -281,10 +308,27 @@ def main() -> int:
         min_positive_recall=max(0.0, min(1.0, args.min_positive_recall)),
         fallback_threshold=max(args.min_threshold, min(args.max_threshold, args.fallback_threshold)),
     )
+    confirmation_min_recall = max(0.0, min(1.0, args.confirmation_min_positive_recall))
+    recommended_confirmation_threshold, confirmation_reason = choose_confirmation_threshold(
+        metrics,
+        min_positive_recall=confirmation_min_recall,
+        fallback_threshold=max(
+            args.min_threshold,
+            min(args.max_threshold, args.confirmation_fallback_threshold),
+        ),
+    )
 
     negative_scores = [float(row.get("max_score") or 0.0) for row in negatives]
     positive_scores = [float(row.get("max_score") or 0.0) for row in positives]
     recommended_row = next((row for row in metrics if float(row["threshold"]) == recommended_threshold), {})
+    recommended_confirmation_row = next(
+        (
+            row
+            for row in metrics
+            if float(row["threshold"]) == recommended_confirmation_threshold
+        ),
+        {},
+    )
     recommended_recall = recommended_row.get("positive_recall") if recommended_row else None
     recall_ready = recommended_recall is None or float(recommended_recall or 0.0) >= max(0.0, min(1.0, args.min_positive_recall))
     calibration = {
@@ -294,6 +338,16 @@ def main() -> int:
         "recommended_threshold": recommended_threshold,
         "recommended_patience": max(1, args.patience),
         "recommendation_reason": reason,
+        "recommended_confirmation_threshold": recommended_confirmation_threshold,
+        "recommended_confirmation_patience": max(1, args.patience),
+        "confirmation_recommendation_reason": confirmation_reason,
+        "confirmation_min_positive_recall": confirmation_min_recall,
+        "confirmation_ready": bool(
+            recommended_confirmation_row
+            and recommended_confirmation_row.get("positive_recall") is not None
+            and float(recommended_confirmation_row.get("positive_recall") or 0.0)
+            >= confirmation_min_recall
+        ),
         "deployment_ready": bool(
             recommended_row
             and int(recommended_row.get("false_positive_clips") or 0) == 0
@@ -314,6 +368,7 @@ def main() -> int:
             "p99": percentile(negative_scores, 99),
         },
         "recommended_metrics": recommended_row,
+        "recommended_confirmation_metrics": recommended_confirmation_row,
         "threshold_metrics": metrics,
         "top_negative_clips": trim_rows(negatives),
         "top_positive_clips": trim_rows(positives),

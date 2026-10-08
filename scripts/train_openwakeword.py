@@ -111,7 +111,7 @@ def sync_artifacts(output_dir: Path, export_dir: Path, model_name: str, metadata
     copied: list[str] = []
 
     for path in sorted(output_dir.glob("*")):
-        if path.suffix.lower() not in {".onnx", ".data", ".tflite"}:
+        if path.suffix.lower() not in {".onnx", ".data"}:
             continue
         dest = export_dir / path.name
         shutil.copy2(path, dest)
@@ -400,6 +400,10 @@ def main() -> int:
             env=env,
             allow_onnx_failure=expected_onnx,
         )
+
+    expected_onnx = output_dir / f"{model_name}.onnx"
+    if not expected_onnx.is_file():
+        raise SystemExit(f"openWakeWord did not produce {expected_onnx}")
 
     export_dir = Path(args.export_dir).resolve()
     onnx_path = sync_artifacts(output_dir, export_dir, model_name, metadata)

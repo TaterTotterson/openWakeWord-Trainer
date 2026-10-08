@@ -140,7 +140,7 @@ def _list_wavs(directory: Path) -> list[dict[str, Any]]:
 def _list_artifacts() -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for path in sorted(TRAINED_DIR.glob("*")):
-        if path.suffix.lower() not in {".onnx", ".data", ".tflite", ".pkl", ".json"}:
+        if path.suffix.lower() not in {".onnx", ".data", ".pkl", ".json"}:
             continue
         stat = path.stat()
         rows.append(

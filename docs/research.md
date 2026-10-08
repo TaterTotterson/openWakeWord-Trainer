@@ -19,7 +19,7 @@ Sources:
 
 ## Model Artifact Choice
 
-ONNX is the primary target here. The upstream trainer attempts ONNX and TFLite export, but TFLite conversion has historically been more dependency-sensitive. ONNX works naturally with openWakeWord's Python runtime and with ONNX Runtime on NVIDIA/Linux, Apple, and other deployment targets.
+ONNX is the only published classifier target here. It works naturally with openWakeWord's Python runtime and with the ONNX Runtime deployment used by Tater Echo firmware. Upstream may create temporary TFLite files while training, but this trainer does not publish them.
 
 ## Personal Samples
 

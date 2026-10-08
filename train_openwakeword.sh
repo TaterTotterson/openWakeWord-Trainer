@@ -64,9 +64,10 @@ fi
 PY="$VENV_DIR/bin/python"
 MPLCONFIGDIR="${MPLCONFIGDIR:-$DATA_ROOT/.cache/matplotlib}"
 PYTHONWARNINGS="${PYTHONWARNINGS:-ignore:pkg_resources is deprecated as an API:UserWarning}"
-TRAIN_DEPS_KEY="cpu"
+TRAIN_REQUIREMENTS_KEY="$(cksum "$ROOT_DIR/requirements-train.txt" | awk '{print $1 ":" $2}')"
+TRAIN_DEPS_KEY="cpu:${TRAIN_REQUIREMENTS_KEY}"
 if [[ -n "${OWW_TORCH_CUDA:-}" && "${OWW_FORCE_CPU:-0}" != "1" ]]; then
-  TRAIN_DEPS_KEY="${OWW_TORCH_VERSION:-2.6.0}+${OWW_TORCH_CUDA}"
+  TRAIN_DEPS_KEY="${OWW_TORCH_VERSION:-2.6.0}+${OWW_TORCH_CUDA}:${TRAIN_REQUIREMENTS_KEY}"
 fi
 
 mkdir -p \

@@ -9,7 +9,7 @@
 
 # openWakeWord Trainer for Apple Silicon and NVIDIA
 
-Train custom openWakeWord models from a local web UI or CLI, with ONNX as the primary artifact, optional TFLite export when the upstream converter succeeds, and optional verifier training from real positive and false-wake clips.
+Train custom openWakeWord models from a local web UI or CLI, with an ONNX classifier for Tater Echo firmware and optional verifier training from real positive and false-wake clips.
 
 This project mirrors the shape of the Tater microWakeWord trainers, but the model strategy is different:
 
@@ -20,7 +20,7 @@ This project mirrors the shape of the Tater microWakeWord trainers, but the mode
 
 ## Why This Path
 
-The official openWakeWord docs still recommend the automated training notebook for production-ish models, and describe the quick Colab as convenient but weaker in some deployments. The automated flow generates target/adversarial clips, augments them with room/background audio, trains against large negative feature sets, and exports ONNX/TFLite.
+The official openWakeWord docs still recommend the automated training notebook for production-ish models, and describe the quick Colab as convenient but weaker in some deployments. The automated flow generates target/adversarial clips, augments them with room/background audio, trains against large negative feature sets, and produces the ONNX classifier used by Tater.
 
 Useful upstream references:
 
@@ -47,7 +47,7 @@ The web UI stores:
 personal_samples/       real positive wake-word clips
 negative_samples/       reviewed false wakes and hard negatives
 captured_audio/         inbox for device uploads
-trained_wake_words/     exported .onnx, .tflite, .pkl, and metadata files
+trained_wake_words/     exported .onnx, .pkl, and metadata files
 logs/                   training logs
 ```
 
@@ -195,7 +195,7 @@ For a deployment check, calibrate the model against reviewed false wakes and gen
   --metadata-json trained_wake_words/hey_tater.json
 ```
 
-The trainer runs this automatically after a successful ONNX export when negative clips are available. Use the reported `recommended_threshold` and `recommended_patience` in your runtime before deploying the model broadly.
+The trainer runs this automatically after a successful ONNX export when negative clips are available. It reports separate policies because the model serves two different jobs: `recommended_threshold` and `recommended_patience` are the stricter standalone OWW settings, while `recommended_confirmation_threshold` and `recommended_confirmation_patience` preserve genuine-wake recall when OWW confirms an earlier MWW detection. Do not force the standalone threshold onto the dual-model confirmation path.
 
 For live microphone testing, use the upstream openWakeWord examples after setup:
 
@@ -210,7 +210,6 @@ Successful training syncs artifacts into:
 
 ```text
 trained_wake_words/<model>.onnx
-trained_wake_words/<model>.tflite       # when upstream conversion succeeds
 trained_wake_words/<model>.json         # local metadata
 trained_wake_words/<model>_verifier.pkl # optional
 ```
