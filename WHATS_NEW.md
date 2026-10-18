@@ -1,2 +1,3 @@
-- Fixed personalized verifier training to load the generated wake-word model by its full path and explicitly use ONNX Runtime.
-- Removed the erroneous LiteRT dependency error that appeared after otherwise successful Apple Silicon and NVIDIA/Blackwell training runs.
+- Restored phonemization of wake phrases containing words missing from CMUdict by using Tater's preserved DeepPhonemizer checkpoint on Hugging Face.
+- Added exact size and SHA-256 verification for the checkpoint, with atomic downloads and automatic replacement of invalid cached S3 error responses.
+- Retained the trusted legacy-checkpoint compatibility path required by PyTorch 2.6 and newer.
