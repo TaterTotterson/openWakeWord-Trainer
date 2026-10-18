@@ -105,7 +105,7 @@ OWW_NEGATIVE_FEATURES=full ./train_openwakeword.sh "hey tater" \
   --max-negative-weight 1500
 ```
 
-The first full run can download many GB of data, including the openWakeWord negative feature file. Keep the `data/` directory around so later runs reuse it. Background audio downloads try the streamed FMA dataset first; if HuggingFace's FMA loader cannot stream on your machine, the trainer generates local 16 kHz fallback background clips and continues. Set `OWW_BACKGROUND_ALLOW_FULL_FMA=1` only if you want to allow the full 7.2 GiB FMA small download.
+The first full run can download many GB of data, including the openWakeWord negative feature file. Keep the `data/` directory around so later runs reuse it. The US-English DeepPhonemizer fallback checkpoint is downloaded from Tater's preservation repository at Hugging Face and verified by exact size and SHA-256 before use; invalid cached downloads are replaced automatically. Background audio downloads try the streamed FMA dataset first; if HuggingFace's FMA loader cannot stream on your machine, the trainer generates local 16 kHz fallback background clips and continues. Set `OWW_BACKGROUND_ALLOW_FULL_FMA=1` only if you want to allow the full 7.2 GiB FMA small download.
 
 ## NVIDIA Docker
 

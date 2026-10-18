@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import sys
 import urllib.request
@@ -20,6 +21,12 @@ VALIDATION_URL = "https://huggingface.co/datasets/davidscripka/openwakeword_feat
 PIPER_GENERATOR_URL = "https://github.com/TaterTotterson/piper-sample-generator/releases/download/models/en_US-libritts_r-medium.pt"
 PIPER_GENERATOR_CONFIG_URL = PIPER_GENERATOR_URL + ".json"
 OPENWAKEWORD_RELEASE_BASE = "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1"
+DEEP_PHONEMIZER_URL = (
+    "https://huggingface.co/TaterTotterson/DeepPhonemizer/resolve/"
+    "31850b409c171a566617c28af12dd664b177d673/en_us_cmudict_forward.pt"
+)
+DEEP_PHONEMIZER_SHA256 = "c2e1fb223d7e027bf7b33052540c6f71d19db6d7fd87ab8671152b8b114501c2"
+DEEP_PHONEMIZER_SIZE = 66_725_366
 OPENWAKEWORD_RESOURCE_MODELS = [
     "melspectrogram.onnx",
     "embedding_model.onnx",
@@ -33,31 +40,84 @@ def log(message: str) -> None:
     print(message, flush=True)
 
 
-def download_file(url: str, dest: Path) -> None:
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def file_is_valid(
+    path: Path,
+    *,
+    expected_size: int | None = None,
+    expected_sha256: str | None = None,
+) -> bool:
+    if not path.is_file() or path.stat().st_size <= 0:
+        return False
+    if expected_size is not None and path.stat().st_size != expected_size:
+        return False
+    if expected_sha256 is not None and file_sha256(path) != expected_sha256.lower():
+        return False
+    return True
+
+
+def download_file(
+    url: str,
+    dest: Path,
+    *,
+    expected_size: int | None = None,
+    expected_sha256: str | None = None,
+) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.exists() and dest.stat().st_size > 0:
+    if file_is_valid(
+        dest,
+        expected_size=expected_size,
+        expected_sha256=expected_sha256,
+    ):
         log(f"Reusing {dest}")
         return
 
+    if dest.exists():
+        log(f"Replacing invalid cached asset: {dest}")
+
     tmp = dest.with_suffix(dest.suffix + ".part")
+    tmp.unlink(missing_ok=True)
     log(f"Downloading {url}")
     log(f"       -> {dest}")
 
-    with urllib.request.urlopen(url) as response, tmp.open("wb") as handle:
-        total = int(response.headers.get("content-length") or 0)
-        seen = 0
-        last_pct = -1
-        while True:
-            chunk = response.read(1024 * 1024)
-            if not chunk:
-                break
-            handle.write(chunk)
-            seen += len(chunk)
-            if total:
-                pct = int(seen * 100 / total)
-                if pct >= last_pct + 5:
-                    log(f"  {pct}%")
-                    last_pct = pct
+    try:
+        with urllib.request.urlopen(url) as response, tmp.open("wb") as handle:
+            total = int(response.headers.get("content-length") or 0)
+            seen = 0
+            last_pct = -1
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                handle.write(chunk)
+                seen += len(chunk)
+                if total:
+                    pct = int(seen * 100 / total)
+                    if pct >= last_pct + 5:
+                        log(f"  {pct}%")
+                        last_pct = pct
+
+        if not file_is_valid(
+            tmp,
+            expected_size=expected_size,
+            expected_sha256=expected_sha256,
+        ):
+            actual_size = tmp.stat().st_size if tmp.exists() else 0
+            actual_sha256 = file_sha256(tmp) if tmp.is_file() else "missing"
+            raise RuntimeError(
+                f"Downloaded asset verification failed for {url}: "
+                f"size={actual_size}, sha256={actual_sha256}"
+            )
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
     tmp.replace(dest)
 
 
@@ -151,6 +211,13 @@ def download_openwakeword_resources() -> None:
     models_dir = OPENWAKEWORD_DIR / "openwakeword" / "resources" / "models"
     for name in OPENWAKEWORD_RESOURCE_MODELS:
         download_file(f"{OPENWAKEWORD_RELEASE_BASE}/{name}", models_dir / name)
+
+    download_file(
+        DEEP_PHONEMIZER_URL,
+        OPENWAKEWORD_DIR / "openwakeword" / "resources" / "en_us_cmudict_forward.pt",
+        expected_size=DEEP_PHONEMIZER_SIZE,
+        expected_sha256=DEEP_PHONEMIZER_SHA256,
+    )
 
 
 def main() -> int:
