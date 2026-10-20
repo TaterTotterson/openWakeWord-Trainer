@@ -26,6 +26,14 @@ class TrainingDependencyTests(unittest.TestCase):
         self.assertIn('mmap_mode="r"', patcher)
         self.assertIn('config.get("validation_batch_size", 2048)', patcher)
 
+    def test_upstream_patch_defaults_feature_extraction_to_cpu_onnx(self) -> None:
+        patcher = (ROOT / "scripts" / "patch_openwakeword_device.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("OWW_FEATURE_DEVICE", patcher)
+        self.assertIn('os.environ.get("OWW_FEATURE_DEVICE", "cpu")', patcher)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -29,6 +29,9 @@ FEATURE_SKIP_PATCHED = (
     '"positive_features_test.npy", "negative_features_test.npy"]):'
 )
 
+FEATURE_DEVICE_ORIGINAL = 'device="gpu" if torch.cuda.is_available() else "cpu",'
+FEATURE_DEVICE_PATCHED = 'device=os.environ.get("OWW_FEATURE_DEVICE", "cpu"),'
+
 STORE_TRUE_DEFAULT_ORIGINAL = '        default="False",'
 STORE_TRUE_DEFAULT_PATCHED = "        default=False,"
 
@@ -200,6 +203,22 @@ def main() -> int:
         text = text.replace(FEATURE_SKIP_ORIGINAL, FEATURE_SKIP_PATCHED)
         changed = True
         print(f"Patched openWakeWord feature completeness check: {train_py}", flush=True)
+
+    if "OWW_FEATURE_DEVICE" in text:
+        print(f"Runtime-compatible feature-device patch already present: {train_py}", flush=True)
+    else:
+        feature_device_uses = text.count(FEATURE_DEVICE_ORIGINAL)
+        if feature_device_uses != 4:
+            raise SystemExit(
+                "Expected four upstream openWakeWord feature-device selections in "
+                f"{train_py}, found {feature_device_uses}"
+            )
+        text = text.replace(FEATURE_DEVICE_ORIGINAL, FEATURE_DEVICE_PATCHED)
+        changed = True
+        print(
+            f"Patched openWakeWord feature extraction to default to CPU ONNX: {train_py}",
+            flush=True,
+        )
 
     if STORE_TRUE_DEFAULT_ORIGINAL in text:
         text = text.replace(STORE_TRUE_DEFAULT_ORIGINAL, STORE_TRUE_DEFAULT_PATCHED)
