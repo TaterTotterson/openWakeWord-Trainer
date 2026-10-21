@@ -32,6 +32,43 @@ FEATURE_SKIP_PATCHED = (
 FEATURE_DEVICE_ORIGINAL = 'device="gpu" if torch.cuda.is_available() else "cpu",'
 FEATURE_DEVICE_PATCHED = 'device=os.environ.get("OWW_FEATURE_DEVICE", "cpu"),'
 
+RANDOM_IMPORT_ORIGINAL = "import uuid\nimport numpy as np"
+RANDOM_IMPORT_PATCHED = "import uuid\nimport random\nimport numpy as np"
+
+REPRODUCIBLE_TRAINING_ANCHOR = """from openwakeword.utils import AudioFeatures
+
+
+# Base model class"""
+REPRODUCIBLE_TRAINING_PATCHED = """from openwakeword.utils import AudioFeatures
+
+
+def configure_reproducible_training():
+    seed = int(os.environ.get("OWW_TRAIN_SEED", "1337"))
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+    return seed
+
+
+OWW_TRAIN_SEED = configure_reproducible_training()
+
+
+# Base model class"""
+
+BEST_VAL_FP_ORIGINAL = '                self.history["val_fp_per_hr"].append(val_fp_per_hr)'
+BEST_VAL_FP_PATCHED = '''                self.history["val_fp_per_hr"].append(val_fp_per_hr)
+                self.best_val_fp = min(
+                    self.best_val_fp,
+                    float(np.asarray(val_fp_per_hr).item()),
+                )'''
+
 STORE_TRUE_DEFAULT_ORIGINAL = '        default="False",'
 STORE_TRUE_DEFAULT_PATCHED = "        default=False,"
 
@@ -219,6 +256,27 @@ def main() -> int:
             f"Patched openWakeWord feature extraction to default to CPU ONNX: {train_py}",
             flush=True,
         )
+
+    if "OWW_TRAIN_SEED = configure_reproducible_training()" in text:
+        print(f"Deterministic training seed patch already present: {train_py}", flush=True)
+    else:
+        if RANDOM_IMPORT_ORIGINAL not in text:
+            raise SystemExit(f"Could not find upstream import block in {train_py}")
+        if REPRODUCIBLE_TRAINING_ANCHOR not in text:
+            raise SystemExit(f"Could not find upstream training class anchor in {train_py}")
+        text = text.replace(RANDOM_IMPORT_ORIGINAL, RANDOM_IMPORT_PATCHED)
+        text = text.replace(REPRODUCIBLE_TRAINING_ANCHOR, REPRODUCIBLE_TRAINING_PATCHED)
+        changed = True
+        print(f"Patched openWakeWord training with a deterministic seed: {train_py}", flush=True)
+
+    if "float(np.asarray(val_fp_per_hr).item())" in text:
+        print(f"False-positive tracking patch already present: {train_py}", flush=True)
+    else:
+        if BEST_VAL_FP_ORIGINAL not in text:
+            raise SystemExit(f"Could not find upstream false-positive history update in {train_py}")
+        text = text.replace(BEST_VAL_FP_ORIGINAL, BEST_VAL_FP_PATCHED)
+        changed = True
+        print(f"Patched openWakeWord false-positive tracking: {train_py}", flush=True)
 
     if STORE_TRUE_DEFAULT_ORIGINAL in text:
         text = text.replace(STORE_TRUE_DEFAULT_ORIGINAL, STORE_TRUE_DEFAULT_PATCHED)

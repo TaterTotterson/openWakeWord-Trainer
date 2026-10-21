@@ -34,6 +34,24 @@ class TrainingDependencyTests(unittest.TestCase):
         self.assertIn("OWW_FEATURE_DEVICE", patcher)
         self.assertIn('os.environ.get("OWW_FEATURE_DEVICE", "cpu")', patcher)
 
+    def test_upstream_patch_makes_training_reproducible(self) -> None:
+        patcher = (ROOT / "scripts" / "patch_openwakeword_device.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("OWW_TRAIN_SEED", patcher)
+        self.assertIn("torch.manual_seed(seed)", patcher)
+        self.assertIn("torch.cuda.manual_seed_all(seed)", patcher)
+        self.assertIn("torch.use_deterministic_algorithms(True, warn_only=True)", patcher)
+
+    def test_upstream_patch_updates_false_positive_tracking(self) -> None:
+        patcher = (ROOT / "scripts" / "patch_openwakeword_device.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("self.best_val_fp = min(", patcher)
+        self.assertIn("float(np.asarray(val_fp_per_hr).item())", patcher)
+
 
 if __name__ == "__main__":
     unittest.main()

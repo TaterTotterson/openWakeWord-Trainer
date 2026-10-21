@@ -27,6 +27,7 @@ Environment:
   OWW_NEGATIVE_TTS_DIVISOR=7        lower is faster but uses more memory
   OWW_DEFAULT_NEGATIVE_BATCH=1024    negative features per training step
   OWW_DEFAULT_VALIDATION_BATCH=2048  false-positive windows evaluated at once
+  OWW_TRAIN_SEED=1337                deterministic model-training seed
   OWW_FORCE_CPU=1                   disable CUDA/MPS visibility
   OWW_DATA_DIR=/data                persistent Docker data root
   OWW_TORCH_CUDA=cu124              install CUDA PyTorch wheels in the training venv
