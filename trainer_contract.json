@@ -4,6 +4,10 @@
     "shared-positive-tts",
     "multiple-background-dirs",
     "multiple-rir-dirs",
-    "shared-negative-feature-bank"
+    "shared-negative-feature-bank",
+    "weighted-hard-negative-sources",
+    "streaming-calibration-sweep",
+    "corrective-quality-retry",
+    "uploaded-audio-holdout"
   ]
 }

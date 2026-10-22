@@ -1,3 +1,5 @@
-- Restored phonemization of wake phrases containing words missing from CMUdict by using Tater's preserved DeepPhonemizer checkpoint on Hugging Face.
-- Added exact size and SHA-256 verification for the checkpoint, with atomic downloads and automatic replacement of invalid cached S3 error responses.
-- Retained the trusted legacy-checkpoint compatibility path required by PyTorch 2.6 and newer.
+- Custom confusing phrases, automatic phonetic negatives, reviewed false wakes, and the broad ACAV bank are now independently sampled training sources. Custom phrases receive a guaranteed share of every hard-negative batch instead of being diluted into the generated corpus.
+- Deployment calibration now evaluates patience 2 through 5, accepts a measured pass at threshold 0.99, records exact misses and false triggers, and favors the lowest safe patience.
+- A failed raw-WAV gate can run one corrective retraining pass with stronger negative weighting, then validates against a fresh deterministic partition.
+- Uploaded recordings are split into stable training and real-device holdout views when at least five clips are available.
+- NVIDIA training now uses the available ONNX Runtime GPU 1.22.0 wheel instead of the unavailable 1.22.1 build.

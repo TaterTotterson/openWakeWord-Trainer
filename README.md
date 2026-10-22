@@ -201,7 +201,9 @@ For a deployment check, calibrate the model against reviewed false wakes and gen
   --metadata-json trained_wake_words/hey_tater.json
 ```
 
-The trainer runs this automatically after a successful ONNX export when negative clips are available. It reports separate policies because the model serves two different jobs: `recommended_threshold` and `recommended_patience` are the stricter standalone OWW settings, while `recommended_confirmation_threshold` and `recommended_confirmation_patience` preserve genuine-wake recall when OWW confirms an earlier MWW detection. Do not force the standalone threshold onto the dual-model confirmation path.
+The trainer runs this automatically after a successful ONNX export when negative clips are available. It evaluates thresholds across patience 2 through 5 and selects the lowest-patience operating point that reaches the strict false-trigger and recall targets. A measured pass at threshold `0.99` is valid. It reports separate policies because the model serves two different jobs: `recommended_threshold` and `recommended_patience` are the stricter standalone OWW settings, while `recommended_confirmation_threshold` and `recommended_confirmation_patience` preserve genuine-wake recall when OWW confirms an earlier MWW detection. Do not force the standalone threshold onto the dual-model confirmation path.
+
+Custom confusing phrases are generated into their own feature source and occupy 30 examples of the default 100-example hard-negative portion of every batch. Automatic phonetic negatives occupy the other 70. Reviewed false wakes are also trained as a separately weighted source, while the broad ACAV feature bank remains independent. If the raw-WAV gate still fails, the trainer performs one corrective pass using generated false triggers, increases hard-negative pressure, and checks a disjoint deterministic holdout partition.
 
 For live microphone testing, use the upstream openWakeWord examples after setup:
 

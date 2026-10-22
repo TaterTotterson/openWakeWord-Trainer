@@ -16,6 +16,8 @@ class TrainingDependencyTests(unittest.TestCase):
             'pip install --no-build-isolation --no-deps -e "$OPENWAKEWORD_DIR"',
             launcher,
         )
+        self.assertIn('OWW_ONNX_RUNTIME_VERSION:-1.22.0', launcher)
+        self.assertIn('onnxruntime==1.22.0', requirements)
 
     def test_upstream_patch_streams_false_positive_validation_batches(self) -> None:
         patcher = (ROOT / "scripts" / "patch_openwakeword_device.py").read_text(

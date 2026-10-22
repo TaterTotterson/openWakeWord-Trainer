@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import contextlib
 import hashlib
 import json
 import math
@@ -54,6 +56,51 @@ def _ordered_wavs(path: Path) -> list[Path]:
         (item.resolve() for item in path.glob("*.wav") if item.is_file()),
         key=lambda item: hashlib.sha256(item.name.encode("utf-8")).hexdigest(),
     )
+
+
+def partition_uploaded_audio(
+    source_dir: Path,
+    output_dir: Path,
+    label: str,
+    *,
+    minimum_for_holdout: int = 5,
+    holdout_fraction: float = 0.20,
+) -> tuple[Path, Path | None]:
+    """Create deterministic train/real-device-holdout views using symlinks."""
+    paths = _ordered_wavs(source_dir)
+    if len(paths) < minimum_for_holdout:
+        return source_dir, None
+    ordered = sorted(
+        paths,
+        key=lambda path: hashlib.sha256(
+            f"{path.name}\0{path.stat().st_size}".encode("utf-8")
+        ).digest(),
+    )
+    holdout_count = max(1, int(round(len(ordered) * holdout_fraction)))
+    holdout = set(ordered[:holdout_count])
+    asset_root = output_dir / "_trainer_assets"
+    train_dir = asset_root / f"{label}_train"
+    holdout_dir = asset_root / f"{label}_holdout"
+    for directory, selected in (
+        (train_dir, [path for path in paths if path not in holdout]),
+        (holdout_dir, [path for path in paths if path in holdout]),
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+        expected = {path.name for path in selected}
+        for stale in directory.glob("*.wav"):
+            if stale.name not in expected:
+                stale.unlink()
+        for path in selected:
+            destination = directory / path.name
+            if destination.is_symlink() and destination.resolve() == path.resolve():
+                continue
+            destination.unlink(missing_ok=True)
+            destination.symlink_to(path.resolve())
+    log(
+        f"Reserved {holdout_count}/{len(paths)} uploaded {label.replace('_', ' ')} "
+        "clip(s) for real-device validation"
+    )
+    return train_dir, holdout_dir
 
 
 def stage_shared_positive_clips(
@@ -136,16 +183,17 @@ def stage_reviewed_negative_clips(
     output_dir: Path,
     model_name: str,
     source_dir: Path,
-) -> None:
-    """Add reviewed false wakes to OWW's generated negative training set."""
-    negative_dir = output_dir / model_name / "negative_train"
+) -> tuple[Path, int]:
+    """Stage reviewed false wakes as an independently weighted source."""
+    clip_root = output_dir / model_name
+    negative_dir = clip_root / "reviewed_negative_train"
     negative_dir.mkdir(parents=True, exist_ok=True)
     reviewed = _ordered_wavs(source_dir)
     digest = hashlib.sha256()
     for path in reviewed:
         stat = path.stat()
         digest.update(f"{path}\0{stat.st_size}\0{stat.st_mtime_ns}\n".encode("utf-8"))
-    marker = output_dir / model_name / ".tater-reviewed-negatives.json"
+    marker = clip_root / ".tater-reviewed-negatives.json"
     fingerprint = {
         "source": str(source_dir.resolve()),
         "count": len(reviewed),
@@ -155,22 +203,223 @@ def stage_reviewed_negative_clips(
         cached = json.loads(marker.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         cached = None
+    # Remove links created by older trainers, where reviewed clips were diluted
+    # into the large automatic adversarial feature array.
+    legacy_dir = clip_root / "negative_train"
+    legacy_managed = list(legacy_dir.glob("tater_reviewed_*.wav"))
+    if legacy_managed:
+        for path in legacy_managed:
+            path.unlink()
+        (clip_root / "negative_features_train.npy").unlink(missing_ok=True)
+
     managed = list(negative_dir.glob("tater_reviewed_*.wav"))
     if cached == fingerprint and len(managed) == len(reviewed):
         if reviewed:
             log(f"Reusing {len(reviewed)} reviewed negative clips")
-        return
+        return negative_dir, len(reviewed)
 
     for path in managed:
         path.unlink()
     for index, source in enumerate(reviewed):
         (negative_dir / f"tater_reviewed_{index:06d}.wav").symlink_to(source)
-    feature = output_dir / model_name / "negative_features_train.npy"
+    feature = clip_root / "reviewed_negative_features_train.npy"
     if feature.exists():
         feature.unlink()
     marker.write_text(json.dumps(fingerprint, indent=2) + "\n", encoding="utf-8")
     if reviewed:
-        log(f"Staged {len(reviewed)} reviewed negative clips for OWW training")
+        log(f"Staged {len(reviewed)} reviewed negative clips as a weighted OWW source")
+    return negative_dir, len(reviewed)
+
+
+def _generated_count(total: int, fraction: float) -> int:
+    return max(0, int(round(max(0, total) * max(0.0, min(1.0, fraction)))))
+
+
+def generate_custom_negative_clips(
+    args: argparse.Namespace,
+    config: dict[str, Any],
+    output_dir: Path,
+    model_name: str,
+) -> tuple[Path, Path]:
+    """Generate custom confusing phrases separately so their weight is explicit."""
+    clip_root = output_dir / model_name
+    train_dir = clip_root / "custom_negative_train"
+    test_dir = clip_root / "custom_negative_test"
+    phrases = list(config.get("weighted_custom_negative_phrases") or [])
+    if not phrases:
+        return train_dir, test_dir
+
+    piper_dir = str(Path(args.piper_dir).resolve())
+    sys.path.insert(0, piper_dir)
+    try:
+        from generate_samples import generate_samples
+    finally:
+        with contextlib.suppress(ValueError):
+            sys.path.remove(piper_dir)
+
+    desired = (
+        (train_dir, _generated_count(args.samples, args.custom_negative_fraction), [0.98], [0.98]),
+        (test_dir, _generated_count(args.validation_samples, args.custom_negative_fraction), [1.0], [1.0]),
+    )
+    batch_size = max(1, args.tts_batch_size // args.negative_tts_batch_divisor)
+    for directory, target_count, noise_scales, noise_scale_ws in desired:
+        directory.mkdir(parents=True, exist_ok=True)
+        current = len(list(directory.glob("*.wav")))
+        needed = max(0, target_count - current)
+        if needed:
+            log(
+                f"Generating {needed} weighted custom-negative clip(s) in {directory.name} "
+                f"from {len(phrases)} phrase(s)"
+            )
+            generate_samples(
+                text=phrases,
+                max_samples=needed,
+                batch_size=batch_size,
+                noise_scales=noise_scales,
+                noise_scale_ws=noise_scale_ws,
+                length_scales=[0.75, 1.0, 1.25],
+                output_dir=str(directory),
+                auto_reduce_batch_size=True,
+            )
+        else:
+            log(f"Reusing {current} weighted custom-negative clip(s) from {directory.name}")
+    return train_dir, test_dir
+
+
+def determine_total_length(positive_dir: Path) -> int:
+    durations: list[int] = []
+    for path in _ordered_wavs(positive_dir):
+        try:
+            with wave.open(str(path), "rb") as handle:
+                rate = int(handle.getframerate() or 0)
+                frames = int(handle.getnframes() or 0)
+            if rate > 0 and frames > 0:
+                durations.append(int(round((frames * 16000 / rate) / 1000) * 1000))
+        except Exception:
+            continue
+    if not durations:
+        return 32000
+    durations.sort()
+    middle = len(durations) // 2
+    median_samples = (
+        durations[middle]
+        if len(durations) % 2
+        else int(round((durations[middle - 1] + durations[middle]) / 2))
+    )
+    total_length = median_samples + 12000
+    if total_length < 32000 or abs(total_length - 32000) <= 4000:
+        return 32000
+    return total_length
+
+
+def _audio_files(paths: list[str]) -> list[str]:
+    files: list[str] = []
+    for raw in paths:
+        directory = Path(raw)
+        if directory.exists():
+            files.extend(str(path) for path in sorted(directory.rglob("*.wav")))
+    return files
+
+
+def build_weighted_feature_source(
+    config: dict[str, Any],
+    source_dir: Path,
+    feature_path: Path,
+    *,
+    augmentation_rounds: int = 1,
+) -> int:
+    """Create one independently sampled OWW feature source with cache validation."""
+    clips = _ordered_wavs(source_dir)
+    if not clips:
+        feature_path.unlink(missing_ok=True)
+        feature_path.with_suffix(feature_path.suffix + ".tater.json").unlink(missing_ok=True)
+        return 0
+
+    total_length = int(
+        config.get("total_length")
+        or determine_total_length(
+            Path(config["output_dir"]) / str(config["model_name"]) / "positive_test"
+        )
+    )
+    config["total_length"] = total_length
+    rounds = max(1, int(augmentation_rounds))
+    digest = hashlib.sha256()
+    for path in clips:
+        stat = path.stat()
+        digest.update(f"{path.name}\0{stat.st_size}\0{stat.st_mtime_ns}\n".encode("utf-8"))
+    fingerprint = {
+        "source": str(source_dir.resolve()),
+        "source_digest": digest.hexdigest(),
+        "clip_count": len(clips),
+        "augmentation_rounds": rounds,
+        "total_length": total_length,
+        "feature_device": os.environ.get("OWW_FEATURE_DEVICE", "cpu"),
+        "background_paths": list(config.get("background_paths") or []),
+        "rir_paths": list(config.get("rir_paths") or []),
+    }
+    marker = feature_path.with_suffix(feature_path.suffix + ".tater.json")
+    try:
+        cached = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        cached = None
+    if cached == fingerprint and feature_path.exists():
+        log(f"Reusing weighted feature source: {feature_path.name}")
+        return len(clips) * rounds
+
+    feature_path.unlink(missing_ok=True)
+    from openwakeword.data import augment_clips
+    from openwakeword.utils import compute_features_from_generator
+    import torch
+
+    augmented = augment_clips(
+        [str(path) for path in clips] * rounds,
+        total_length=total_length,
+        batch_size=max(1, int(config.get("augmentation_batch_size", 16))),
+        background_clip_paths=_audio_files(list(config.get("background_paths") or [])),
+        RIR_paths=_audio_files(list(config.get("rir_paths") or [])),
+    )
+    cpu_count = os.cpu_count() or 1
+    compute_features_from_generator(
+        augmented,
+        n_total=len(clips) * rounds,
+        clip_duration=total_length,
+        output_file=str(feature_path),
+        device=os.environ.get("OWW_FEATURE_DEVICE", "cpu"),
+        ncpu=1 if torch.cuda.is_available() else max(1, cpu_count // 2),
+    )
+    marker.write_text(json.dumps(fingerprint, indent=2) + "\n", encoding="utf-8")
+    log(f"Built weighted feature source: {feature_path.name} ({len(clips) * rounds} samples)")
+    return len(clips) * rounds
+
+
+def stage_corrective_negative_clips(
+    paths: list[str],
+    destination: Path,
+    *,
+    excluded_roots: list[Path],
+) -> list[Path]:
+    destination.mkdir(parents=True, exist_ok=True)
+    selected: list[Path] = []
+    for raw in paths:
+        source = Path(raw).expanduser().resolve()
+        if not source.is_file():
+            continue
+        if any(source.is_relative_to(root.resolve()) for root in excluded_roots if root):
+            continue
+        selected.append(source)
+    expected: set[str] = set()
+    for index, source in enumerate(sorted(set(selected), key=lambda path: str(path))):
+        name = f"{index:04d}_{safe_name(source.stem)}.wav"
+        expected.add(name)
+        target = destination / name
+        if target.is_symlink() and target.resolve() == source:
+            continue
+        target.unlink(missing_ok=True)
+        target.symlink_to(source)
+    for stale in destination.glob("*.wav"):
+        if stale.name not in expected:
+            stale.unlink()
+    return _ordered_wavs(destination)
 
 
 def make_config(args: argparse.Namespace, model_name: str, output_dir: Path) -> dict[str, Any]:
@@ -218,10 +467,21 @@ def make_config(args: argparse.Namespace, model_name: str, output_dir: Path) -> 
             seen_negative_phrases.add(key)
             custom_negative_phrases.append(phrase)
 
+    feature_save_dir = output_dir / model_name
+    if custom_negative_phrases:
+        feature_data_files["custom_negative"] = str(
+            feature_save_dir / "custom_negative_features_train.npy"
+        )
+        batch_n_per_class["custom_negative"] = args.custom_negative_batch
+
     return {
         "model_name": model_name,
         "target_phrase": [args.phrase],
-        "custom_negative_phrases": custom_negative_phrases,
+        # Keep custom phrases out of upstream's combined adversarial pool. They
+        # are generated and sampled separately below with a guaranteed batch share.
+        "custom_negative_phrases": [],
+        "weighted_custom_negative_phrases": custom_negative_phrases,
+        "custom_negative_fraction": args.custom_negative_fraction,
         "n_samples": args.samples,
         "n_samples_val": args.validation_samples,
         "tts_batch_size": args.tts_batch_size,
@@ -294,6 +554,10 @@ def generated_clip_dirs(output_dir: Path, model_name: str) -> list[Path]:
         clip_dir / "positive_test",
         clip_dir / "negative_train",
         clip_dir / "negative_test",
+        clip_dir / "custom_negative_train",
+        clip_dir / "custom_negative_test",
+        clip_dir / "reviewed_negative_train",
+        clip_dir / "quality_retry_negative",
     ]
 
 
@@ -362,18 +626,33 @@ def train_verifier(args: argparse.Namespace, base_model: Path, model_name: str) 
     run(cmd)
 
 
-def run_calibration(args: argparse.Namespace, onnx_path: Path, model_name: str, metadata_path: Path) -> None:
-    positive_dirs = [
-        Path(args.positive_dir).resolve(),
-        Path(args.output_root).resolve() / model_name / model_name / "positive_test",
+def run_calibration(
+    args: argparse.Namespace,
+    onnx_path: Path,
+    model_name: str,
+    metadata_path: Path,
+    *,
+    sample_partition: int = 0,
+) -> dict[str, Any] | None:
+    clip_root = Path(args.output_root).resolve() / model_name / model_name
+    positive_dirs = [clip_root / "positive_test"]
+    negative_dirs = [clip_root / "negative_test", clip_root / "custom_negative_test"]
+    priority_positive_dirs = [
+        Path(value).resolve()
+        for value in [getattr(args, "positive_holdout_dir", None) or args.positive_dir]
+        if value
     ]
-    negative_dirs = [
-        Path(args.negative_dir).resolve(),
-        Path(args.output_root).resolve() / model_name / model_name / "negative_test",
+    priority_negative_dirs = [
+        Path(value).resolve()
+        for value in [getattr(args, "negative_holdout_dir", None) or args.negative_dir]
+        if value
     ]
-    if not any(path.exists() and any(path.glob("*.wav")) for path in negative_dirs):
+    all_negative_dirs = negative_dirs + priority_negative_dirs
+    if not any(path.exists() and any(path.glob("*.wav")) for path in all_negative_dirs):
         log("Skipping calibration: no negative WAV clips found")
-        return
+        return None
+
+    report_path = clip_root / f"{model_name}.calibration.json"
 
     cmd = [
         sys.executable,
@@ -384,12 +663,20 @@ def run_calibration(args: argparse.Namespace, onnx_path: Path, model_name: str, 
         "onnx",
         "--patience",
         str(args.calibration_patience),
+        "--max-patience",
+        str(args.calibration_max_patience),
+        "--sample-partition",
+        str(max(0, sample_partition)),
         "--positive-limit",
         str(args.calibration_positive_limit),
         "--negative-limit",
         str(args.calibration_negative_limit),
         "--metadata-json",
         str(metadata_path),
+        "--output",
+        str(report_path),
+        "--min-positive-recall",
+        str(args.calibration_min_positive_recall),
     ]
     for directory in positive_dirs:
         if directory.exists():
@@ -397,12 +684,82 @@ def run_calibration(args: argparse.Namespace, onnx_path: Path, model_name: str, 
     for directory in negative_dirs:
         if directory.exists():
             cmd.extend(["--negative-dir", str(directory)])
+    for directory in priority_positive_dirs:
+        if directory.exists():
+            cmd.extend(["--priority-positive-dir", str(directory)])
+    for directory in priority_negative_dirs:
+        if directory.exists():
+            cmd.extend(["--priority-negative-dir", str(directory)])
 
     log("")
     log("$ " + " ".join(cmd))
     result = subprocess.run(cmd, cwd=str(ROOT_DIR), env=os.environ.copy())
     if result.returncode != 0:
         log(f"WARNING: calibration exited {result.returncode}; model artifact still exists at {onnx_path}")
+        return None
+    try:
+        return json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        log(f"WARNING: could not read calibration report {report_path}: {exc}")
+        return None
+
+
+def build_corrective_retry(
+    args: argparse.Namespace,
+    config: dict[str, Any],
+    output_dir: Path,
+    model_name: str,
+    calibration: dict[str, Any],
+) -> dict[str, Any] | None:
+    paths = list(
+        (calibration.get("misclassified") or {}).get("triggered_negative_paths") or []
+    )
+    holdout_roots = [
+        Path(value).resolve()
+        for value in [getattr(args, "negative_holdout_dir", None)]
+        if value
+    ]
+    clip_root = output_dir / model_name
+    retry_dir = clip_root / "quality_retry_negative"
+    staged = stage_corrective_negative_clips(
+        paths,
+        retry_dir,
+        excluded_roots=holdout_roots,
+    )
+    if not staged:
+        return None
+
+    retry = copy.deepcopy(config)
+    feature_path = clip_root / "quality_retry_negative_features.npy"
+    samples = build_weighted_feature_source(
+        retry,
+        retry_dir,
+        feature_path,
+        augmentation_rounds=max(1, args.reviewed_negative_augmentation_rounds),
+    )
+    if samples <= 0:
+        return None
+
+    retry["feature_data_files"]["quality_retry_negative"] = str(feature_path)
+    retry["batch_n_per_class"]["quality_retry_negative"] = min(
+        max(1, args.corrective_negative_batch),
+        samples,
+    )
+    for key in ("adversarial_negative", "custom_negative"):
+        if key in retry["batch_n_per_class"]:
+            retry["batch_n_per_class"][key] = max(
+                1,
+                int(round(retry["batch_n_per_class"][key] * args.corrective_batch_multiplier)),
+            )
+    retry["max_negative_weight"] = max(
+        3000,
+        int(round(float(retry.get("max_negative_weight") or 1500) * args.corrective_weight_multiplier)),
+    )
+    retry["quality_retry"] = {
+        "triggered_negative_paths": [str(path) for path in staged],
+        "source_sample_partition": int(calibration.get("sample_partition") or 0),
+    }
+    return retry
 
 
 def log_torch_devices() -> None:
@@ -450,7 +807,34 @@ def main() -> int:
     parser.add_argument("--augmentation-batch-size", type=int, default=int(os.environ.get("OWW_DEFAULT_AUG_BATCH", "16")))
     parser.add_argument("--augmentation-rounds", type=int, default=1)
     parser.add_argument("--positive-batch", type=int, default=50)
-    parser.add_argument("--adversarial-batch", type=int, default=50)
+    parser.add_argument(
+        "--adversarial-batch",
+        type=int,
+        default=int(os.environ.get("OWW_DEFAULT_ADVERSARIAL_BATCH", "70")),
+        help="Automatic phonetic hard negatives included in every training batch.",
+    )
+    parser.add_argument(
+        "--custom-negative-batch",
+        type=int,
+        default=int(os.environ.get("OWW_DEFAULT_CUSTOM_NEGATIVE_BATCH", "30")),
+        help="Custom confusing-phrase examples included in every training batch.",
+    )
+    parser.add_argument(
+        "--custom-negative-fraction",
+        type=float,
+        default=float(os.environ.get("OWW_CUSTOM_NEGATIVE_FRACTION", "0.30")),
+        help="Custom-negative clip count relative to the automatic corpus (default: 0.30).",
+    )
+    parser.add_argument(
+        "--reviewed-negative-batch",
+        type=int,
+        default=int(os.environ.get("OWW_DEFAULT_REVIEWED_NEGATIVE_BATCH", "25")),
+    )
+    parser.add_argument(
+        "--reviewed-negative-augmentation-rounds",
+        type=int,
+        default=int(os.environ.get("OWW_REVIEWED_NEGATIVE_AUGMENTATION_ROUNDS", "10")),
+    )
     parser.add_argument(
         "--negative-batch",
         type=int,
@@ -515,6 +899,12 @@ def main() -> int:
     parser.add_argument("--calibration-positive-limit", type=int, default=int(os.environ.get("OWW_CALIBRATION_POSITIVE_LIMIT", "200")))
     parser.add_argument("--calibration-negative-limit", type=int, default=int(os.environ.get("OWW_CALIBRATION_NEGATIVE_LIMIT", "500")))
     parser.add_argument("--calibration-patience", type=int, default=int(os.environ.get("OWW_CALIBRATION_PATIENCE", "2")))
+    parser.add_argument("--calibration-max-patience", type=int, default=int(os.environ.get("OWW_CALIBRATION_MAX_PATIENCE", "5")))
+    parser.add_argument("--calibration-min-positive-recall", type=float, default=float(os.environ.get("OWW_CALIBRATION_MIN_RECALL", "0.90")))
+    parser.add_argument("--calibration-retries", type=int, default=int(os.environ.get("OWW_CALIBRATION_RETRIES", "1")))
+    parser.add_argument("--corrective-negative-batch", type=int, default=int(os.environ.get("OWW_CORRECTIVE_NEGATIVE_BATCH", "50")))
+    parser.add_argument("--corrective-batch-multiplier", type=float, default=float(os.environ.get("OWW_CORRECTIVE_BATCH_MULTIPLIER", "1.5")))
+    parser.add_argument("--corrective-weight-multiplier", type=float, default=float(os.environ.get("OWW_CORRECTIVE_WEIGHT_MULTIPLIER", "2.0")))
     parser.add_argument(
         "--force-cpu",
         action="store_true",
@@ -528,11 +918,31 @@ def main() -> int:
         raise SystemExit("--negative-batch must be 1 or greater")
     if args.validation_batch_size < 1:
         raise SystemExit("--validation-batch-size must be 1 or greater")
+    if args.adversarial_batch < 1 or args.custom_negative_batch < 1:
+        raise SystemExit("hard-negative batch sizes must be 1 or greater")
+    if not 0.0 <= args.custom_negative_fraction <= 1.0:
+        raise SystemExit("--custom-negative-fraction must be between 0 and 1")
+    if args.calibration_max_patience < args.calibration_patience:
+        raise SystemExit("--calibration-max-patience cannot be lower than --calibration-patience")
 
     model_name = safe_name(args.model_name or args.phrase)
     output_dir = Path(args.output_root).resolve() / model_name
     output_dir.mkdir(parents=True, exist_ok=True)
     config_path = output_dir / f"{model_name}.yaml"
+    clip_root = output_dir / model_name
+
+    positive_training_dir, positive_holdout_dir = partition_uploaded_audio(
+        Path(args.positive_dir).resolve(),
+        clip_root,
+        "personal_positive",
+    )
+    negative_training_dir, negative_holdout_dir = partition_uploaded_audio(
+        Path(args.negative_dir).resolve(),
+        clip_root,
+        "reviewed_negative",
+    )
+    args.positive_holdout_dir = str(positive_holdout_dir) if positive_holdout_dir else ""
+    args.negative_holdout_dir = str(negative_holdout_dir) if negative_holdout_dir else ""
 
     openwakeword_dir = Path(args.openwakeword_dir).resolve()
     train_py = openwakeword_dir / "openwakeword" / "train.py"
@@ -547,7 +957,7 @@ def main() -> int:
             Path(args.positive_tts_dir).resolve(),
             args.samples,
             args.validation_samples,
-            Path(args.positive_dir).resolve(),
+            positive_training_dir,
         )
     config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
     log(f"Wrote config: {config_path}")
@@ -589,14 +999,44 @@ def main() -> int:
 
     if not args.skip_generate:
         run([sys.executable, str(train_py), "--training_config", str(config_path), "--generate_clips"], env=env)
-    stage_reviewed_negative_clips(
+        generate_custom_negative_clips(args, config, output_dir, model_name)
+    reviewed_dir, reviewed_count = stage_reviewed_negative_clips(
         output_dir,
         model_name,
-        Path(args.negative_dir).resolve(),
+        negative_training_dir,
     )
     if not args.skip_augment:
         normalize_generated_clip_sample_rates(output_dir, model_name)
         run([sys.executable, str(train_py), "--training_config", str(config_path), "--augment_clips"], env=env)
+
+    custom_train_dir = clip_root / "custom_negative_train"
+    custom_feature = clip_root / "custom_negative_features_train.npy"
+    if config.get("weighted_custom_negative_phrases"):
+        custom_samples = build_weighted_feature_source(
+            config,
+            custom_train_dir,
+            custom_feature,
+        )
+        if custom_samples <= 0:
+            raise SystemExit("Custom negative phrases were configured but produced no training clips")
+        config["feature_data_files"]["custom_negative"] = str(custom_feature)
+
+    if reviewed_count:
+        reviewed_feature = clip_root / "reviewed_negative_features_train.npy"
+        reviewed_samples = build_weighted_feature_source(
+            config,
+            reviewed_dir,
+            reviewed_feature,
+            augmentation_rounds=args.reviewed_negative_augmentation_rounds,
+        )
+        config["feature_data_files"]["reviewed_negative"] = str(reviewed_feature)
+        config["batch_n_per_class"]["reviewed_negative"] = min(
+            args.reviewed_negative_batch,
+            reviewed_samples,
+        )
+
+    # Persist paths and weights for the distinct hard-negative sources before training.
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
     if not args.skip_train:
         missing_features = [path for path in generated_feature_files(output_dir, model_name) if not path.exists()]
         if missing_features and args.skip_augment:
@@ -619,8 +1059,76 @@ def main() -> int:
 
     export_dir = Path(args.export_dir).resolve()
     onnx_path = sync_artifacts(output_dir, export_dir, model_name, metadata)
+    calibration: dict[str, Any] | None = None
     if onnx_path and not args.skip_calibration:
-        run_calibration(args, onnx_path, model_name, export_dir / f"{model_name}.json")
+        calibration = run_calibration(
+            args,
+            onnx_path,
+            model_name,
+            export_dir / f"{model_name}.json",
+            sample_partition=0,
+        )
+
+    retries_used = 0
+    while (
+        onnx_path
+        and calibration is not None
+        and not bool(calibration.get("deployment_ready"))
+        and retries_used < max(0, args.calibration_retries)
+    ):
+        retry_config = build_corrective_retry(
+            args,
+            config,
+            output_dir,
+            model_name,
+            calibration,
+        )
+        if retry_config is None:
+            log("Calibration failed, but no eligible generated false triggers were available for retry")
+            break
+
+        retries_used += 1
+        history_dir = clip_root / "quality_attempts"
+        history_dir.mkdir(parents=True, exist_ok=True)
+        source_model = output_dir / f"{model_name}.onnx"
+        shutil.move(
+            str(source_model),
+            str(history_dir / f"{model_name}.attempt-{retries_used}.onnx"),
+        )
+        calibration_path = clip_root / f"{model_name}.calibration.json"
+        if calibration_path.exists():
+            shutil.copy2(
+                calibration_path,
+                history_dir / f"{model_name}.calibration.attempt-{retries_used}.json",
+            )
+
+        retry_path = output_dir / f"{model_name}.quality-retry-{retries_used}.yaml"
+        retry_path.write_text(yaml.safe_dump(retry_config, sort_keys=False), encoding="utf-8")
+        log(
+            f"Calibration retry {retries_used}/{args.calibration_retries}: "
+            f"negative weight={retry_config['max_negative_weight']}, "
+            f"hard-negative batches={retry_config['batch_n_per_class']}"
+        )
+        run(
+            [sys.executable, str(train_py), "--training_config", str(retry_path), "--train_model"],
+            env=env,
+            allow_onnx_failure=source_model,
+        )
+        if not source_model.exists():
+            raise SystemExit("openWakeWord corrective retry did not produce an ONNX model")
+
+        metadata["quality_retries_used"] = retries_used
+        metadata["retry_config"] = retry_config
+        onnx_path = sync_artifacts(output_dir, export_dir, model_name, metadata)
+        calibration = run_calibration(
+            args,
+            onnx_path,
+            model_name,
+            export_dir / f"{model_name}.json",
+            sample_partition=retries_used,
+        )
+
+    metadata["quality_retries_used"] = retries_used
     if args.train_verifier and onnx_path:
         train_verifier(args, onnx_path, model_name)
 

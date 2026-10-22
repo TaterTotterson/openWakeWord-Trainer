@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
-import random
 import wave
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,25 +11,60 @@ from statistics import median
 from typing import Any
 
 
-def collect_wavs(paths: list[str], *, limit: int, seed: int) -> list[Path]:
+def deterministic_sample(paths: list[Path], limit: int, partition: int = 0) -> list[Path]:
+    """Choose a stable partition so corrective retries use fresh audio."""
+    if limit <= 0 or len(paths) <= limit:
+        return paths
+
+    def stable_key(path: Path) -> bytes:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        return hashlib.sha256(f"{path.name}\0{size}".encode("utf-8")).digest()
+
+    shuffled = sorted(paths, key=stable_key)
+    start = (max(0, int(partition)) * limit) % len(shuffled)
+    rotated = shuffled[start:] + shuffled[:start]
+    return rotated[:limit]
+
+
+def collect_wavs(
+    paths: list[str],
+    *,
+    priority_paths: list[str] | None = None,
+    limit: int,
+    seed: int,
+    partition: int = 0,
+) -> list[Path]:
+    del seed  # Retained for command-line compatibility; stable hashes choose the set.
     wavs: list[Path] = []
     seen: set[Path] = set()
-    for raw in paths:
-        if not raw:
-            continue
-        path = Path(raw).expanduser().resolve()
-        candidates = [path] if path.is_file() else sorted(path.rglob("*.wav")) if path.exists() else []
-        for candidate in candidates:
-            if candidate.suffix.lower() != ".wav":
+
+    def add(raw_paths: list[str]) -> list[Path]:
+        added: list[Path] = []
+        for raw in raw_paths:
+            if not raw:
                 continue
-            resolved = candidate.resolve()
-            if resolved not in seen:
-                seen.add(resolved)
-                wavs.append(resolved)
-    wavs.sort(key=lambda item: str(item))
-    if limit > 0 and len(wavs) > limit:
-        rng = random.Random(seed)
-        wavs = sorted(rng.sample(wavs, limit), key=lambda item: str(item))
+            path = Path(raw).expanduser().resolve()
+            candidates = [path] if path.is_file() else sorted(path.rglob("*.wav")) if path.exists() else []
+            for candidate in candidates:
+                if candidate.suffix.lower() != ".wav":
+                    continue
+                resolved = candidate.resolve()
+                if resolved not in seen:
+                    seen.add(resolved)
+                    added.append(resolved)
+        return added
+
+    priority = add(priority_paths or [])
+    regular = add(paths)
+    priority.sort(key=lambda item: str(item))
+    regular = deterministic_sample(regular, max(0, limit - len(priority)), partition)
+    wavs.extend(priority)
+    wavs.extend(regular)
+    if limit > 0:
+        wavs = wavs[:limit]
     return wavs
 
 
@@ -166,25 +201,68 @@ def build_metrics(
     positives: list[dict[str, Any]],
     negatives: list[dict[str, Any]],
     thresholds: list[float],
-    patience: int,
+    patience: int | list[int],
 ) -> list[dict[str, Any]]:
     negative_hours = sum(float(row.get("duration_s") or 0.0) for row in negatives) / 3600.0
     metrics: list[dict[str, Any]] = []
-    for threshold in thresholds:
-        false_clips = activation_count(negatives, threshold, patience)
-        true_clips = activation_count(positives, threshold, patience)
-        metrics.append(
-            {
-                "threshold": threshold,
-                "patience": patience,
-                "false_positive_clips": false_clips,
-                "false_positive_rate": false_clips / len(negatives) if negatives else 0.0,
-                "false_positives_per_hour": false_clips / negative_hours if negative_hours > 0 else None,
-                "positive_clips_detected": true_clips,
-                "positive_recall": true_clips / len(positives) if positives else None,
-            }
-        )
+    patience_values = [patience] if isinstance(patience, int) else patience
+    for patience_value in sorted({max(1, int(value)) for value in patience_values}):
+        for threshold in thresholds:
+            false_clips = activation_count(negatives, threshold, patience_value)
+            true_clips = activation_count(positives, threshold, patience_value)
+            metrics.append(
+                {
+                    "threshold": threshold,
+                    "patience": patience_value,
+                    "false_positive_clips": false_clips,
+                    "false_positive_rate": false_clips / len(negatives) if negatives else 0.0,
+                    "false_positives_per_hour": false_clips / negative_hours if negative_hours > 0 else None,
+                    "positive_clips_detected": true_clips,
+                    "positive_recall": true_clips / len(positives) if positives else None,
+                }
+            )
     return metrics
+
+
+def choose_operating_point(
+    metrics: list[dict[str, Any]],
+    *,
+    max_false_positive_rate: float,
+    min_positive_recall: float,
+    fallback_threshold: float,
+) -> tuple[dict[str, Any], str]:
+    ordered = sorted(
+        metrics,
+        key=lambda row: (int(row.get("patience") or 1), float(row.get("threshold") or 0.0)),
+    )
+    candidates = [
+        row
+        for row in ordered
+        if float(row.get("false_positive_rate") or 0.0) <= max_false_positive_rate
+        and (
+            row.get("positive_recall") is None
+            or float(row.get("positive_recall") or 0.0) >= min_positive_recall
+        )
+    ]
+    if candidates:
+        return candidates[0], "meets_false_positive_and_recall_targets"
+
+    safe_candidates = [
+        row
+        for row in ordered
+        if float(row.get("false_positive_rate") or 0.0) <= max_false_positive_rate
+    ]
+    if safe_candidates:
+        return safe_candidates[0], "meets_false_positive_target_but_recall_is_low"
+
+    fallback_rows = sorted(
+        metrics,
+        key=lambda row: (
+            abs(float(row.get("threshold") or 0.0) - fallback_threshold),
+            -int(row.get("patience") or 1),
+        ),
+    )
+    return (fallback_rows[0] if fallback_rows else {}), "no_threshold_met_false_positive_target"
 
 
 def choose_threshold(
@@ -194,22 +272,13 @@ def choose_threshold(
     min_positive_recall: float,
     fallback_threshold: float,
 ) -> tuple[float, str]:
-    candidates = [
-        row
-        for row in metrics
-        if float(row.get("false_positive_rate") or 0.0) <= max_false_positive_rate
-        and (row.get("positive_recall") is None or float(row.get("positive_recall") or 0.0) >= min_positive_recall)
-    ]
-    if candidates:
-        return float(candidates[0]["threshold"]), "meets_false_positive_and_recall_targets"
-
-    safe_candidates = [
-        row for row in metrics if float(row.get("false_positive_rate") or 0.0) <= max_false_positive_rate
-    ]
-    if safe_candidates:
-        return float(safe_candidates[0]["threshold"]), "meets_false_positive_target_but_recall_is_low"
-
-    return float(fallback_threshold), "no_threshold_met_false_positive_target"
+    row, reason = choose_operating_point(
+        metrics,
+        max_false_positive_rate=max_false_positive_rate,
+        min_positive_recall=min_positive_recall,
+        fallback_threshold=fallback_threshold,
+    )
+    return float(row.get("threshold", fallback_threshold)), reason
 
 
 def choose_confirmation_threshold(
@@ -235,6 +304,53 @@ def choose_confirmation_threshold(
         selected = max(candidates, key=lambda row: float(row.get("threshold") or 0.0))
         return float(selected["threshold"]), "meets_dual_confirmation_recall_target"
     return float(fallback_threshold), "no_threshold_met_dual_confirmation_recall_target"
+
+
+def choose_confirmation_operating_point(
+    metrics: list[dict[str, Any]],
+    *,
+    min_positive_recall: float,
+    fallback_threshold: float,
+) -> tuple[dict[str, Any], str]:
+    candidates = [
+        row
+        for row in metrics
+        if row.get("positive_recall") is not None
+        and float(row.get("positive_recall") or 0.0) >= min_positive_recall
+    ]
+    if candidates:
+        minimum_patience = min(int(row.get("patience") or 1) for row in candidates)
+        same_patience = [
+            row for row in candidates if int(row.get("patience") or 1) == minimum_patience
+        ]
+        return max(same_patience, key=lambda row: float(row.get("threshold") or 0.0)), (
+            "meets_dual_confirmation_recall_target"
+        )
+    fallback_rows = sorted(
+        metrics,
+        key=lambda row: (
+            abs(float(row.get("threshold") or 0.0) - fallback_threshold),
+            int(row.get("patience") or 1),
+        ),
+    )
+    return (fallback_rows[0] if fallback_rows else {}), (
+        "no_threshold_met_dual_confirmation_recall_target"
+    )
+
+
+def misclassified_paths(
+    rows: list[dict[str, Any]],
+    threshold: float,
+    patience: int,
+    *,
+    expected_positive: bool,
+) -> list[str]:
+    paths: list[str] = []
+    for row in rows:
+        triggered = max_consecutive(row.get("frames") or [], threshold) >= patience
+        if triggered != expected_positive:
+            paths.append(str(row.get("path") or ""))
+    return [path for path in paths if path]
 
 
 def trim_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -269,10 +385,14 @@ def main() -> int:
     parser.add_argument("--framework", choices=("onnx", "tflite"), default="onnx")
     parser.add_argument("--positive-dir", action="append", default=[])
     parser.add_argument("--negative-dir", action="append", default=[])
+    parser.add_argument("--priority-positive-dir", action="append", default=[])
+    parser.add_argument("--priority-negative-dir", action="append", default=[])
     parser.add_argument("--positive-limit", type=int, default=200)
     parser.add_argument("--negative-limit", type=int, default=500)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--patience", type=int, default=2)
+    parser.add_argument("--max-patience", type=int, default=5)
+    parser.add_argument("--sample-partition", type=int, default=0)
     parser.add_argument("--min-threshold", type=float, default=0.50)
     parser.add_argument("--max-threshold", type=float, default=0.99)
     parser.add_argument("--threshold-step", type=float, default=0.01)
@@ -289,8 +409,20 @@ def main() -> int:
     if not model_path.exists():
         raise SystemExit(f"Model not found: {model_path}")
 
-    positive_wavs = collect_wavs(args.positive_dir, limit=max(0, args.positive_limit), seed=args.seed)
-    negative_wavs = collect_wavs(args.negative_dir, limit=max(0, args.negative_limit), seed=args.seed)
+    positive_wavs = collect_wavs(
+        args.positive_dir,
+        priority_paths=args.priority_positive_dir,
+        limit=max(0, args.positive_limit),
+        seed=args.seed,
+        partition=args.sample_partition,
+    )
+    negative_wavs = collect_wavs(
+        args.negative_dir,
+        priority_paths=args.priority_negative_dir,
+        limit=max(0, args.negative_limit),
+        seed=args.seed,
+        partition=args.sample_partition,
+    )
     if not negative_wavs:
         print("WARNING: no negative WAV clips found; using conservative fallback threshold", flush=True)
 
@@ -301,15 +433,24 @@ def main() -> int:
     negatives = score_wavs(model, negative_wavs, "negative") if negative_wavs else []
 
     thresholds = threshold_values(args.min_threshold, args.max_threshold, args.threshold_step)
-    metrics = build_metrics(positives, negatives, thresholds, max(1, args.patience))
-    recommended_threshold, reason = choose_threshold(
+    minimum_patience = max(1, args.patience)
+    maximum_patience = max(minimum_patience, args.max_patience)
+    metrics = build_metrics(
+        positives,
+        negatives,
+        thresholds,
+        list(range(minimum_patience, maximum_patience + 1)),
+    )
+    recommended_row, reason = choose_operating_point(
         metrics,
         max_false_positive_rate=max(0.0, args.max_false_positive_rate),
         min_positive_recall=max(0.0, min(1.0, args.min_positive_recall)),
         fallback_threshold=max(args.min_threshold, min(args.max_threshold, args.fallback_threshold)),
     )
+    recommended_threshold = float(recommended_row.get("threshold", args.fallback_threshold))
+    recommended_patience = int(recommended_row.get("patience", maximum_patience))
     confirmation_min_recall = max(0.0, min(1.0, args.confirmation_min_positive_recall))
-    recommended_confirmation_threshold, confirmation_reason = choose_confirmation_threshold(
+    recommended_confirmation_row, confirmation_reason = choose_confirmation_operating_point(
         metrics,
         min_positive_recall=confirmation_min_recall,
         fallback_threshold=max(
@@ -317,18 +458,15 @@ def main() -> int:
             min(args.max_threshold, args.confirmation_fallback_threshold),
         ),
     )
+    recommended_confirmation_threshold = float(
+        recommended_confirmation_row.get("threshold", args.confirmation_fallback_threshold)
+    )
+    recommended_confirmation_patience = int(
+        recommended_confirmation_row.get("patience", minimum_patience)
+    )
 
     negative_scores = [float(row.get("max_score") or 0.0) for row in negatives]
     positive_scores = [float(row.get("max_score") or 0.0) for row in positives]
-    recommended_row = next((row for row in metrics if float(row["threshold"]) == recommended_threshold), {})
-    recommended_confirmation_row = next(
-        (
-            row
-            for row in metrics
-            if float(row["threshold"]) == recommended_confirmation_threshold
-        ),
-        {},
-    )
     recommended_recall = recommended_row.get("positive_recall") if recommended_row else None
     recall_ready = recommended_recall is None or float(recommended_recall or 0.0) >= max(0.0, min(1.0, args.min_positive_recall))
     calibration = {
@@ -336,10 +474,10 @@ def main() -> int:
         "model": str(model_path),
         "framework": args.framework,
         "recommended_threshold": recommended_threshold,
-        "recommended_patience": max(1, args.patience),
+        "recommended_patience": recommended_patience,
         "recommendation_reason": reason,
         "recommended_confirmation_threshold": recommended_confirmation_threshold,
-        "recommended_confirmation_patience": max(1, args.patience),
+        "recommended_confirmation_patience": recommended_confirmation_patience,
         "confirmation_recommendation_reason": confirmation_reason,
         "confirmation_min_positive_recall": confirmation_min_recall,
         "confirmation_ready": bool(
@@ -350,10 +488,13 @@ def main() -> int:
         ),
         "deployment_ready": bool(
             recommended_row
+            and positives
+            and negatives
             and int(recommended_row.get("false_positive_clips") or 0) == 0
-            and recommended_threshold < args.max_threshold
+            and recommended_threshold <= args.max_threshold
             and recall_ready
         ),
+        "sample_partition": max(0, args.sample_partition),
         "positive_clip_count": len(positives),
         "negative_clip_count": len(negatives),
         "positive_score_summary": {
@@ -370,6 +511,20 @@ def main() -> int:
         "recommended_metrics": recommended_row,
         "recommended_confirmation_metrics": recommended_confirmation_row,
         "threshold_metrics": metrics,
+        "misclassified": {
+            "missed_positive_paths": misclassified_paths(
+                positives,
+                recommended_threshold,
+                recommended_patience,
+                expected_positive=True,
+            ),
+            "triggered_negative_paths": misclassified_paths(
+                negatives,
+                recommended_threshold,
+                recommended_patience,
+                expected_positive=False,
+            ),
+        },
         "top_negative_clips": trim_rows(negatives),
         "top_positive_clips": trim_rows(positives),
     }
