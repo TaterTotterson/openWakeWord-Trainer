@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -47,14 +48,143 @@ def existing_wav_dir(path: Path) -> bool:
     return path.exists() and any(path.glob("*.wav"))
 
 
+def _ordered_wavs(path: Path) -> list[Path]:
+    """Return a stable, well-shuffled ordering without depending on RNG state."""
+    return sorted(
+        (item.resolve() for item in path.glob("*.wav") if item.is_file()),
+        key=lambda item: hashlib.sha256(item.name.encode("utf-8")).hexdigest(),
+    )
+
+
+def stage_shared_positive_clips(
+    output_dir: Path,
+    model_name: str,
+    source_dir: Path,
+    train_count: int,
+    validation_count: int,
+    personal_dir: Path | None = None,
+) -> None:
+    """Reuse the trainer's canonical TTS corpus instead of regenerating it with Piper."""
+    source_wavs = _ordered_wavs(source_dir)
+    required = train_count + validation_count
+    if len(source_wavs) < required:
+        raise SystemExit(
+            f"Shared positive TTS corpus needs {required} WAV files but only "
+            f"{len(source_wavs)} were found in {source_dir}"
+        )
+
+    clip_root = output_dir / model_name
+    train_dir = clip_root / "positive_train"
+    validation_dir = clip_root / "positive_test"
+    personal_wavs = _ordered_wavs(personal_dir) if personal_dir and personal_dir.exists() else []
+    selected = {
+        train_dir: source_wavs[:train_count],
+        validation_dir: source_wavs[train_count:required],
+    }
+    source_digest = hashlib.sha256()
+    for path in source_wavs[:required]:
+        stat = path.stat()
+        source_digest.update(
+            f"{path}\0{stat.st_size}\0{stat.st_mtime_ns}\n".encode("utf-8")
+        )
+    for path in personal_wavs:
+        stat = path.stat()
+        source_digest.update(
+            f"personal\0{path}\0{stat.st_size}\0{stat.st_mtime_ns}\n".encode("utf-8")
+        )
+    fingerprint = {
+        "source": str(source_dir.resolve()),
+        "train_count": train_count,
+        "validation_count": validation_count,
+        "personal_count": len(personal_wavs),
+        "source_digest": source_digest.hexdigest(),
+    }
+    marker = clip_root / ".tater-shared-positive.json"
+    try:
+        cached = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        cached = None
+    if cached == fingerprint and all(
+        directory.exists()
+        and len(list(directory.glob("*.wav")))
+        == len(paths) + (len(personal_wavs) if directory == train_dir else 0)
+        for directory, paths in selected.items()
+    ):
+        log(f"Reusing {required} shared positive TTS clips")
+        return
+
+    for directory, paths in selected.items():
+        if directory.exists():
+            shutil.rmtree(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        for index, source in enumerate(paths):
+            (directory / f"tater_shared_{index:06d}.wav").symlink_to(source)
+    for index, source in enumerate(personal_wavs):
+        (train_dir / f"tater_personal_{index:06d}.wav").symlink_to(source)
+
+    for feature_path in generated_feature_files(output_dir, model_name):
+        if feature_path.name.startswith("positive_") and feature_path.exists():
+            feature_path.unlink()
+    marker.write_text(json.dumps(fingerprint, indent=2) + "\n", encoding="utf-8")
+    log(
+        f"Staged {train_count} shared and {len(personal_wavs)} personal training positives, "
+        f"plus {validation_count} shared validation positives"
+    )
+
+
+def stage_reviewed_negative_clips(
+    output_dir: Path,
+    model_name: str,
+    source_dir: Path,
+) -> None:
+    """Add reviewed false wakes to OWW's generated negative training set."""
+    negative_dir = output_dir / model_name / "negative_train"
+    negative_dir.mkdir(parents=True, exist_ok=True)
+    reviewed = _ordered_wavs(source_dir)
+    digest = hashlib.sha256()
+    for path in reviewed:
+        stat = path.stat()
+        digest.update(f"{path}\0{stat.st_size}\0{stat.st_mtime_ns}\n".encode("utf-8"))
+    marker = output_dir / model_name / ".tater-reviewed-negatives.json"
+    fingerprint = {
+        "source": str(source_dir.resolve()),
+        "count": len(reviewed),
+        "source_digest": digest.hexdigest(),
+    }
+    try:
+        cached = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        cached = None
+    managed = list(negative_dir.glob("tater_reviewed_*.wav"))
+    if cached == fingerprint and len(managed) == len(reviewed):
+        if reviewed:
+            log(f"Reusing {len(reviewed)} reviewed negative clips")
+        return
+
+    for path in managed:
+        path.unlink()
+    for index, source in enumerate(reviewed):
+        (negative_dir / f"tater_reviewed_{index:06d}.wav").symlink_to(source)
+    feature = output_dir / model_name / "negative_features_train.npy"
+    if feature.exists():
+        feature.unlink()
+    marker.write_text(json.dumps(fingerprint, indent=2) + "\n", encoding="utf-8")
+    if reviewed:
+        log(f"Staged {len(reviewed)} reviewed negative clips for OWW training")
+
+
 def make_config(args: argparse.Namespace, model_name: str, output_dir: Path) -> dict[str, Any]:
     data_dir = Path(args.data_dir).resolve()
     piper_dir = Path(args.piper_dir).resolve()
-    features = data_dir / "openwakeword_features_ACAV100M_2000_hrs_16bit.npy"
+    feature_bank_dir = Path(args.feature_bank_dir).resolve()
+    features = feature_bank_dir / "openwakeword_features_ACAV100M_2000_hrs_16bit.npy"
     validation = data_dir / "validation_set_features.npy"
 
     background_paths = []
-    for candidate in (data_dir / "audioset_16k", data_dir / "fma", data_dir / "background_clips"):
+    background_candidates = [Path(value).resolve() for value in args.background_dir]
+    if not background_candidates:
+        background_candidates = [data_dir / "audioset_16k", data_dir / "fma", data_dir / "background_clips"]
+    for candidate in background_candidates:
         if existing_wav_dir(candidate):
             background_paths.append(str(candidate))
 
@@ -78,10 +208,20 @@ def make_config(args: argparse.Namespace, model_name: str, output_dir: Path) -> 
     if not validation.exists():
         log("WARNING: validation_set_features.npy is missing; run scripts/download_assets.py")
 
+    target_key = " ".join(args.phrase.casefold().split())
+    custom_negative_phrases = []
+    seen_negative_phrases: set[str] = set()
+    for value in args.custom_negative_phrase:
+        phrase = " ".join(str(value).split())
+        key = phrase.casefold()
+        if phrase and key != target_key and key not in seen_negative_phrases:
+            seen_negative_phrases.add(key)
+            custom_negative_phrases.append(phrase)
+
     return {
         "model_name": model_name,
         "target_phrase": [args.phrase],
-        "custom_negative_phrases": args.custom_negative_phrase,
+        "custom_negative_phrases": custom_negative_phrases,
         "n_samples": args.samples,
         "n_samples_val": args.validation_samples,
         "tts_batch_size": args.tts_batch_size,
@@ -89,7 +229,11 @@ def make_config(args: argparse.Namespace, model_name: str, output_dir: Path) -> 
         "augmentation_batch_size": args.augmentation_batch_size,
         "piper_sample_generator_path": str(piper_dir),
         "output_dir": str(output_dir),
-        "rir_paths": [str(data_dir / "mit_rirs")],
+        "rir_paths": [
+            str(path)
+            for path in ([Path(value).resolve() for value in args.rir_dir] or [data_dir / "mit_rirs"])
+            if existing_wav_dir(path)
+        ],
         "background_paths": background_paths,
         "background_paths_duplication_rate": [1 for _ in background_paths],
         "false_positive_validation_data_path": str(validation),
@@ -275,6 +419,18 @@ def log_torch_devices() -> None:
     log(f"Device availability: cuda={cuda_available}, mps={mps_available}, selected={selected}")
 
 
+def log_feature_provider() -> None:
+    import onnxruntime as ort
+
+    requested = os.environ.get("OWW_FEATURE_DEVICE", "cpu").strip().lower()
+    providers = ort.get_available_providers()
+    log(f"ONNX feature provider policy: {requested}; available={providers}")
+    if requested == "gpu" and "CUDAExecutionProvider" not in providers:
+        raise SystemExit(
+            "OWW_FEATURE_DEVICE requested GPU, but ONNX Runtime has no CUDAExecutionProvider"
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run the openWakeWord automatic training pipeline.")
     data_root = Path(os.environ.get("OWW_DATA_DIR", str(ROOT_DIR))).resolve()
@@ -313,7 +469,29 @@ def main() -> int:
     parser.add_argument("--target-fp-per-hour", type=float, default=float(os.environ.get("OWW_DEFAULT_TARGET_FP", "0.2")))
     parser.add_argument("--max-negative-weight", type=int, default=int(os.environ.get("OWW_DEFAULT_MAX_NEGATIVE_WEIGHT", "1500")))
     parser.add_argument("--custom-negative-phrase", action="append", default=[])
+    parser.add_argument(
+        "--positive-tts-dir",
+        default=os.environ.get("OWW_POSITIVE_TTS_DIR", ""),
+        help="Reuse a shared generated positive-TTS WAV corpus instead of generating OWW positives.",
+    )
+    parser.add_argument(
+        "--background-dir",
+        action="append",
+        default=[],
+        help="Raw background-audio directory; repeat to combine multiple shared corpora.",
+    )
+    parser.add_argument(
+        "--rir-dir",
+        action="append",
+        default=[],
+        help="Room-impulse-response directory; repeat to combine multiple shared corpora.",
+    )
     parser.add_argument("--data-dir", default=str(asset_dir))
+    parser.add_argument(
+        "--feature-bank-dir",
+        default=os.environ.get("OWW_FEATURE_BANK_DIR", str(asset_dir)),
+        help="Persistent directory containing the broad negative feature bank.",
+    )
     parser.add_argument("--output-root", default=os.environ.get("OWW_OUTPUT_ROOT", str(data_root / "output")))
     parser.add_argument(
         "--export-dir",
@@ -336,7 +514,7 @@ def main() -> int:
     parser.add_argument("--skip-calibration", action="store_true")
     parser.add_argument("--calibration-positive-limit", type=int, default=int(os.environ.get("OWW_CALIBRATION_POSITIVE_LIMIT", "200")))
     parser.add_argument("--calibration-negative-limit", type=int, default=int(os.environ.get("OWW_CALIBRATION_NEGATIVE_LIMIT", "500")))
-    parser.add_argument("--calibration-patience", type=int, default=int(os.environ.get("OWW_CALIBRATION_PATIENCE", "3")))
+    parser.add_argument("--calibration-patience", type=int, default=int(os.environ.get("OWW_CALIBRATION_PATIENCE", "2")))
     parser.add_argument(
         "--force-cpu",
         action="store_true",
@@ -362,6 +540,15 @@ def main() -> int:
         raise SystemExit(f"openWakeWord train.py not found at {train_py}. Run ./train_openwakeword.sh first.")
 
     config = make_config(args, model_name, output_dir)
+    if args.positive_tts_dir:
+        stage_shared_positive_clips(
+            output_dir,
+            model_name,
+            Path(args.positive_tts_dir).resolve(),
+            args.samples,
+            args.validation_samples,
+            Path(args.positive_dir).resolve(),
+        )
     config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
     log(f"Wrote config: {config_path}")
 
@@ -391,6 +578,7 @@ def main() -> int:
 
     os.environ.update({key: value for key, value in env.items() if key in {"OWW_ENABLE_MPS", "CUDA_VISIBLE_DEVICES"}})
     log_torch_devices()
+    log_feature_provider()
     log(f"Piper generator device policy: {env.get('OWW_PIPER_DEVICE', 'auto')}")
     negative_tts_batch = max(1, args.tts_batch_size // args.negative_tts_batch_divisor)
     log(
@@ -401,6 +589,11 @@ def main() -> int:
 
     if not args.skip_generate:
         run([sys.executable, str(train_py), "--training_config", str(config_path), "--generate_clips"], env=env)
+    stage_reviewed_negative_clips(
+        output_dir,
+        model_name,
+        Path(args.negative_dir).resolve(),
+    )
     if not args.skip_augment:
         normalize_generated_clip_sample_rates(output_dir, model_name)
         run([sys.executable, str(train_py), "--training_config", str(config_path), "--augment_clips"], env=env)

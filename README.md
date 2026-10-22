@@ -107,6 +107,12 @@ OWW_NEGATIVE_FEATURES=full ./train_openwakeword.sh "hey tater" \
 
 The first full run can download many GB of data, including the openWakeWord negative feature file. Keep the `data/` directory around so later runs reuse it. The US-English DeepPhonemizer fallback checkpoint is downloaded from Tater's preservation repository at Hugging Face and verified by exact size and SHA-256 before use; invalid cached downloads are replaced automatically. Background audio downloads try the streamed FMA dataset first; if HuggingFace's FMA loader cannot stream on your machine, the trainer generates local 16 kHz fallback background clips and continues. Set `OWW_BACKGROUND_ALLOW_FULL_FMA=1` only if you want to allow the full 7.2 GiB FMA small download.
 
+When launched by the combined Tater trainers, `--positive-tts-dir` reuses the
+already generated wake-word speech, repeatable `--background-dir` and
+`--rir-dir` options reuse the main trainer's augmentation audio, and
+`--feature-bank-dir` points OWW at the same persistent negative bank used by
+NanoWakeWord.
+
 ## NVIDIA Docker
 
 Build:

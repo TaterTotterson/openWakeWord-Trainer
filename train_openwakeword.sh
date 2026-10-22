@@ -27,6 +27,7 @@ Environment:
   OWW_NEGATIVE_TTS_DIVISOR=7        lower is faster but uses more memory
   OWW_DEFAULT_NEGATIVE_BATCH=1024    negative features per training step
   OWW_DEFAULT_VALIDATION_BATCH=2048  false-positive windows evaluated at once
+  OWW_FEATURE_DEVICE=cpu|gpu         ONNX feature extraction provider
   OWW_TRAIN_SEED=1337                deterministic model-training seed
   OWW_FORCE_CPU=1                   disable CUDA/MPS visibility
   OWW_DATA_DIR=/data                persistent Docker data root
@@ -49,6 +50,7 @@ OUTPUT_ROOT="${OWW_OUTPUT_ROOT:-$DATA_ROOT/output}"
 EXPORT_DIR="${OWW_EXPORT_DIR:-${OWW_TRAINED_DIR:-$DATA_ROOT/trained_wake_words}}"
 POSITIVE_DIR="${OWW_PERSONAL_DIR:-$DATA_ROOT/personal_samples}"
 NEGATIVE_DIR="${OWW_NEGATIVE_DIR:-$DATA_ROOT/negative_samples}"
+FEATURE_BANK_DIR="${OWW_FEATURE_BANK_DIR:-$ASSET_DIR}"
 VENV_DIR="${OWW_VENV_DIR:-$DATA_ROOT/.venv}"
 PIPER_REPO_URL="${OWW_PIPER_REPO_URL:-https://github.com/TaterTotterson/piper-sample-generator.git}"
 if [[ -n "${OWW_PYTHON_BIN:-}" ]]; then
@@ -70,9 +72,11 @@ PY="$VENV_DIR/bin/python"
 MPLCONFIGDIR="${MPLCONFIGDIR:-$DATA_ROOT/.cache/matplotlib}"
 PYTHONWARNINGS="${PYTHONWARNINGS:-ignore:pkg_resources is deprecated as an API:UserWarning}"
 TRAIN_REQUIREMENTS_KEY="$(cksum "$ROOT_DIR/requirements-train.txt" | awk '{print $1 ":" $2}')"
-TRAIN_DEPS_KEY="cpu:${TRAIN_REQUIREMENTS_KEY}"
+ONNX_RUNTIME_VERSION="${OWW_ONNX_RUNTIME_VERSION:-1.22.1}"
+FEATURE_DEVICE="${OWW_FEATURE_DEVICE:-cpu}"
+TRAIN_DEPS_KEY="cpu:${FEATURE_DEVICE}:ort-${ONNX_RUNTIME_VERSION}:${TRAIN_REQUIREMENTS_KEY}"
 if [[ -n "${OWW_TORCH_CUDA:-}" && "${OWW_FORCE_CPU:-0}" != "1" ]]; then
-  TRAIN_DEPS_KEY="${OWW_TORCH_VERSION:-2.6.0}+${OWW_TORCH_CUDA}:${TRAIN_REQUIREMENTS_KEY}"
+  TRAIN_DEPS_KEY="${OWW_TORCH_VERSION:-2.6.0}+${OWW_TORCH_CUDA}:${FEATURE_DEVICE}:ort-${ONNX_RUNTIME_VERSION}:${TRAIN_REQUIREMENTS_KEY}"
 fi
 
 mkdir -p \
@@ -82,6 +86,7 @@ mkdir -p \
   "$EXPORT_DIR" \
   "$POSITIVE_DIR" \
   "$NEGATIVE_DIR" \
+  "$FEATURE_BANK_DIR" \
   "$DATA_ROOT/logs" \
   "$MPLCONFIGDIR"
 export MPLCONFIGDIR PYTHONWARNINGS OWW_OPENWAKEWORD_DIR="$OPENWAKEWORD_DIR" OWW_PIPER_DIR="$PIPER_DIR"
@@ -154,6 +159,7 @@ install_cuda_torch() {
 write_filtered_train_requirements() {
   local filtered="$VENV_DIR/requirements-train.no-torch.txt"
   "$PY" - "$ROOT_DIR/requirements-train.txt" "$filtered" <<'PY'
+import os
 import re
 import sys
 from pathlib import Path
@@ -161,6 +167,8 @@ from pathlib import Path
 source = Path(sys.argv[1])
 dest = Path(sys.argv[2])
 skip = {"torch", "torchaudio"}
+if os.environ.get("OWW_FEATURE_DEVICE", "cpu").strip().lower() == "gpu":
+    skip.add("onnxruntime")
 lines = []
 
 for line in source.read_text(encoding="utf-8").splitlines():
@@ -183,6 +191,14 @@ if [[ ! -f "$VENV_DIR/.train_deps_installed" || "$(cat "$VENV_DIR/.train_deps_ke
     "$PY" -m pip install -r "$FILTERED_REQUIREMENTS"
   else
     "$PY" -m pip install -r requirements-train.txt
+  fi
+
+  if [[ "$FEATURE_DEVICE" == "gpu" && "${OWW_FORCE_CPU:-0}" != "1" ]]; then
+    "$PY" -m pip uninstall -y onnxruntime onnxruntime-gpu >/dev/null 2>&1 || true
+    "$PY" -m pip install "onnxruntime-gpu==${ONNX_RUNTIME_VERSION}"
+  else
+    "$PY" -m pip uninstall -y onnxruntime-gpu >/dev/null 2>&1 || true
+    "$PY" -m pip install "onnxruntime==${ONNX_RUNTIME_VERSION}"
   fi
 
   touch "$VENV_DIR/.train_deps_installed"
@@ -321,10 +337,11 @@ else
   DOWNLOAD_ARGS+=(--skip-rirs)
 fi
 
-"$PY" scripts/download_assets.py --data-dir "$ASSET_DIR" "${DOWNLOAD_ARGS[@]}"
+"$PY" scripts/download_assets.py --data-dir "$ASSET_DIR" --feature-bank-dir "$FEATURE_BANK_DIR" "${DOWNLOAD_ARGS[@]}"
 
 TRAIN_ARGS=(
   --data-dir "$ASSET_DIR"
+  --feature-bank-dir "$FEATURE_BANK_DIR"
   --output-root "$OUTPUT_ROOT"
   --export-dir "$EXPORT_DIR"
   --openwakeword-dir "$OPENWAKEWORD_DIR"

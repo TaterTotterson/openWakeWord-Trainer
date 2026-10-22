@@ -1,0 +1,9 @@
+{
+  "api_version": 2,
+  "capabilities": [
+    "shared-positive-tts",
+    "multiple-background-dirs",
+    "multiple-rir-dirs",
+    "shared-negative-feature-bank"
+  ]
+}

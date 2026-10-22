@@ -223,6 +223,11 @@ def download_openwakeword_resources() -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Download reusable openWakeWord training assets.")
     parser.add_argument("--data-dir", default=os.environ.get("OWW_DATA_DIR", str(ROOT_DIR / "data")))
+    parser.add_argument(
+        "--feature-bank-dir",
+        default=os.environ.get("OWW_FEATURE_BANK_DIR", ""),
+        help="Optional shared directory for the large negative feature bank.",
+    )
     parser.add_argument("--negative-features", choices=("full", "skip"), default="full")
     parser.add_argument("--skip-rirs", action="store_true")
     parser.add_argument("--skip-background", action="store_true")
@@ -231,11 +236,13 @@ def main() -> int:
 
     data_dir = Path(args.data_dir).resolve()
     data_dir.mkdir(parents=True, exist_ok=True)
+    feature_bank_dir = Path(args.feature_bank_dir).resolve() if args.feature_bank_dir else data_dir
+    feature_bank_dir.mkdir(parents=True, exist_ok=True)
 
     download_file(VALIDATION_URL, data_dir / "validation_set_features.npy")
 
     if args.negative_features == "full":
-        download_file(FEATURES_URL, data_dir / "openwakeword_features_ACAV100M_2000_hrs_16bit.npy")
+        download_file(FEATURES_URL, feature_bank_dir / "openwakeword_features_ACAV100M_2000_hrs_16bit.npy")
     else:
         log("Skipping full negative feature download")
 

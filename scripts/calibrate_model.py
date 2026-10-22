@@ -272,7 +272,7 @@ def main() -> int:
     parser.add_argument("--positive-limit", type=int, default=200)
     parser.add_argument("--negative-limit", type=int, default=500)
     parser.add_argument("--seed", type=int, default=1337)
-    parser.add_argument("--patience", type=int, default=3)
+    parser.add_argument("--patience", type=int, default=2)
     parser.add_argument("--min-threshold", type=float, default=0.50)
     parser.add_argument("--max-threshold", type=float, default=0.99)
     parser.add_argument("--threshold-step", type=float, default=0.01)
