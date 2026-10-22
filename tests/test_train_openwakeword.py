@@ -19,6 +19,7 @@ sys.modules.setdefault("yaml", types.ModuleType("yaml"))
 
 from train_openwakeword import (  # noqa: E402
     make_config,
+    merge_corrective_negative_paths,
     partition_uploaded_audio,
     stage_corrective_negative_clips,
     stage_reviewed_negative_clips,
@@ -62,6 +63,25 @@ class ArtifactExportTests(unittest.TestCase):
 
             self.assertEqual(len(staged), 1)
             self.assertEqual(staged[0].read_bytes(), b"generated")
+
+    def test_corrective_retries_accumulate_false_triggers(self) -> None:
+        first = merge_corrective_negative_paths(
+            [],
+            {"misclassified": {"triggered_negative_paths": ["first.wav"]}},
+        )
+        second = merge_corrective_negative_paths(
+            first,
+            {
+                "misclassified": {
+                    "triggered_negative_paths": ["first.wav", "second.wav"]
+                }
+            },
+        )
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(second), 2)
+        self.assertTrue(second[0].endswith("first.wav"))
+        self.assertTrue(second[1].endswith("second.wav"))
 
     def test_config_reads_broad_negatives_from_shared_bank(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

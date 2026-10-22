@@ -8,6 +8,9 @@
     "weighted-hard-negative-sources",
     "streaming-calibration-sweep",
     "corrective-quality-retry",
-    "uploaded-audio-holdout"
+    "uploaded-audio-holdout",
+    "source-aware-deployment-gate",
+    "cumulative-corrective-retries",
+    "expanded-classifier-capacity"
   ]
 }

@@ -11,9 +11,11 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 from calibrate_model import (  # noqa: E402
+    build_metrics,
     choose_confirmation_operating_point,
     choose_confirmation_threshold,
     choose_operating_point,
+    choose_source_aware_operating_point,
     choose_threshold,
     deterministic_sample,
 )
@@ -99,6 +101,57 @@ class CalibrationPolicyTests(unittest.TestCase):
         second = deterministic_sample(paths, 20, partition=1)
         self.assertEqual(first, deterministic_sample(paths, 20, partition=0))
         self.assertTrue(set(first).isdisjoint(second))
+
+    def test_generated_stress_tail_can_pass_at_one_percent(self) -> None:
+        positives = [
+            {"frames": [0.95, 0.95], "duration_s": 1.0} for _ in range(10)
+        ]
+        generated = [
+            {"frames": [0.95, 0.95] if index == 0 else [0.0], "duration_s": 1.0}
+            for index in range(100)
+        ]
+        real_device = [{"frames": [0.0], "duration_s": 1.0} for _ in range(5)]
+        metrics = build_metrics(
+            positives,
+            generated,
+            [0.90],
+            2,
+            real_negatives=real_device,
+        )
+
+        selected, reason = choose_source_aware_operating_point(
+            metrics,
+            max_generated_false_positive_rate=0.01,
+            min_positive_recall=0.90,
+            fallback_threshold=0.95,
+        )
+
+        self.assertEqual(selected["generated_false_positive_rate"], 0.01)
+        self.assertEqual(selected["real_device_false_positive_clips"], 0)
+        self.assertEqual(
+            reason, "meets_source_aware_false_positive_and_recall_targets"
+        )
+
+    def test_real_device_false_wake_remains_a_hard_failure(self) -> None:
+        selected, reason = choose_source_aware_operating_point(
+            [
+                {
+                    "threshold": 0.99,
+                    "patience": 5,
+                    "generated_false_positive_rate": 0.0,
+                    "real_device_false_positive_clips": 1,
+                    "positive_recall": 0.95,
+                }
+            ],
+            max_generated_false_positive_rate=0.01,
+            min_positive_recall=0.90,
+            fallback_threshold=0.95,
+        )
+
+        self.assertEqual(selected["real_device_false_positive_clips"], 1)
+        self.assertEqual(
+            reason, "no_operating_point_met_source_aware_false_positive_target"
+        )
 
 
 if __name__ == "__main__":

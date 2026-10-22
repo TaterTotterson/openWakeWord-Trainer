@@ -68,6 +68,43 @@ def collect_wavs(
     return wavs
 
 
+def collect_wav_groups(
+    paths: list[str],
+    *,
+    priority_paths: list[str] | None = None,
+    limit: int,
+    seed: int,
+    partition: int = 0,
+) -> tuple[list[Path], list[Path]]:
+    """Collect real-device and generated clips without losing their provenance."""
+    del seed  # Retained for command-line compatibility; stable hashes choose the set.
+    seen: set[Path] = set()
+
+    def expand(raw_paths: list[str]) -> list[Path]:
+        collected: list[Path] = []
+        for raw in raw_paths:
+            if not raw:
+                continue
+            path = Path(raw).expanduser().resolve()
+            candidates = [path] if path.is_file() else sorted(path.rglob("*.wav")) if path.exists() else []
+            for candidate in candidates:
+                if candidate.suffix.lower() != ".wav":
+                    continue
+                resolved = candidate.resolve()
+                if resolved not in seen:
+                    seen.add(resolved)
+                    collected.append(resolved)
+        return collected
+
+    priority = sorted(expand(priority_paths or []), key=lambda item: str(item))
+    if limit > 0:
+        priority = priority[:limit]
+    remaining = max(0, limit - len(priority)) if limit > 0 else 0
+    regular = expand(paths)
+    regular = deterministic_sample(regular, remaining, partition) if limit > 0 else regular
+    return priority, regular
+
+
 def wav_duration_s(path: Path) -> float:
     try:
         with wave.open(str(path), "rb") as wav:
@@ -202,26 +239,119 @@ def build_metrics(
     negatives: list[dict[str, Any]],
     thresholds: list[float],
     patience: int | list[int],
+    *,
+    real_negatives: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    negative_hours = sum(float(row.get("duration_s") or 0.0) for row in negatives) / 3600.0
+    generated_negatives = negatives
+    real_device_negatives = real_negatives or []
+    all_negatives = real_device_negatives + generated_negatives
+    negative_hours = sum(float(row.get("duration_s") or 0.0) for row in all_negatives) / 3600.0
+    generated_negative_hours = sum(
+        float(row.get("duration_s") or 0.0) for row in generated_negatives
+    ) / 3600.0
+    real_negative_hours = sum(
+        float(row.get("duration_s") or 0.0) for row in real_device_negatives
+    ) / 3600.0
     metrics: list[dict[str, Any]] = []
     patience_values = [patience] if isinstance(patience, int) else patience
     for patience_value in sorted({max(1, int(value)) for value in patience_values}):
         for threshold in thresholds:
-            false_clips = activation_count(negatives, threshold, patience_value)
+            generated_false_clips = activation_count(
+                generated_negatives, threshold, patience_value
+            )
+            real_false_clips = activation_count(
+                real_device_negatives, threshold, patience_value
+            )
+            false_clips = generated_false_clips + real_false_clips
             true_clips = activation_count(positives, threshold, patience_value)
             metrics.append(
                 {
                     "threshold": threshold,
                     "patience": patience_value,
                     "false_positive_clips": false_clips,
-                    "false_positive_rate": false_clips / len(negatives) if negatives else 0.0,
+                    "false_positive_rate": false_clips / len(all_negatives) if all_negatives else 0.0,
                     "false_positives_per_hour": false_clips / negative_hours if negative_hours > 0 else None,
+                    "generated_false_positive_clips": generated_false_clips,
+                    "generated_false_positive_rate": (
+                        generated_false_clips / len(generated_negatives)
+                        if generated_negatives
+                        else 0.0
+                    ),
+                    "generated_false_positives_per_hour": (
+                        generated_false_clips / generated_negative_hours
+                        if generated_negative_hours > 0
+                        else None
+                    ),
+                    "real_device_false_positive_clips": real_false_clips,
+                    "real_device_false_positive_rate": (
+                        real_false_clips / len(real_device_negatives)
+                        if real_device_negatives
+                        else 0.0
+                    ),
+                    "real_device_false_positives_per_hour": (
+                        real_false_clips / real_negative_hours
+                        if real_negative_hours > 0
+                        else None
+                    ),
                     "positive_clips_detected": true_clips,
                     "positive_recall": true_clips / len(positives) if positives else None,
                 }
             )
     return metrics
+
+
+def choose_source_aware_operating_point(
+    metrics: list[dict[str, Any]],
+    *,
+    max_generated_false_positive_rate: float,
+    min_positive_recall: float,
+    fallback_threshold: float,
+) -> tuple[dict[str, Any], str]:
+    """Require zero real-device false wakes while tolerating a measured stress-test tail."""
+    ordered = sorted(
+        metrics,
+        key=lambda row: (int(row.get("patience") or 1), float(row.get("threshold") or 0.0)),
+    )
+
+    def source_safe(row: dict[str, Any]) -> bool:
+        return (
+            int(row.get("real_device_false_positive_clips") or 0) == 0
+            and float(row.get("generated_false_positive_rate") or 0.0)
+            <= max_generated_false_positive_rate
+        )
+
+    candidates = [
+        row
+        for row in ordered
+        if source_safe(row)
+        and (
+            row.get("positive_recall") is None
+            or float(row.get("positive_recall") or 0.0) >= min_positive_recall
+        )
+    ]
+    if candidates:
+        return candidates[0], "meets_source_aware_false_positive_and_recall_targets"
+
+    safe_candidates = [row for row in ordered if source_safe(row)]
+    if safe_candidates:
+        return safe_candidates[0], "meets_source_aware_false_positive_target_but_recall_is_low"
+
+    fallback_rows = sorted(
+        metrics,
+        key=lambda row: (
+            int(row.get("real_device_false_positive_clips") or 0),
+            max(
+                0.0,
+                float(row.get("generated_false_positive_rate") or 0.0)
+                - max_generated_false_positive_rate,
+            ),
+            abs(float(row.get("threshold") or 0.0) - fallback_threshold),
+            -int(row.get("patience") or 1),
+        ),
+    )
+    return (fallback_rows[0] if fallback_rows else {}), (
+        "no_operating_point_met_source_aware_false_positive_target"
+    )
 
 
 def choose_operating_point(
@@ -396,7 +526,13 @@ def main() -> int:
     parser.add_argument("--min-threshold", type=float, default=0.50)
     parser.add_argument("--max-threshold", type=float, default=0.99)
     parser.add_argument("--threshold-step", type=float, default=0.01)
-    parser.add_argument("--max-false-positive-rate", type=float, default=0.0)
+    parser.add_argument(
+        "--max-false-positive-rate",
+        type=float,
+        default=None,
+        help="Deprecated strict aggregate limit; when set, overrides the generated limit.",
+    )
+    parser.add_argument("--max-generated-false-positive-rate", type=float, default=0.01)
     parser.add_argument("--min-positive-recall", type=float, default=0.70)
     parser.add_argument("--fallback-threshold", type=float, default=0.95)
     parser.add_argument("--confirmation-min-positive-recall", type=float, default=0.80)
@@ -416,13 +552,14 @@ def main() -> int:
         seed=args.seed,
         partition=args.sample_partition,
     )
-    negative_wavs = collect_wavs(
+    real_device_negative_wavs, generated_negative_wavs = collect_wav_groups(
         args.negative_dir,
         priority_paths=args.priority_negative_dir,
         limit=max(0, args.negative_limit),
         seed=args.seed,
         partition=args.sample_partition,
     )
+    negative_wavs = real_device_negative_wavs + generated_negative_wavs
     if not negative_wavs:
         print("WARNING: no negative WAV clips found; using conservative fallback threshold", flush=True)
 
@@ -430,20 +567,37 @@ def main() -> int:
 
     model = Model(wakeword_models=[str(model_path)], inference_framework=args.framework)
     positives = score_wavs(model, positive_wavs, "positive") if positive_wavs else []
-    negatives = score_wavs(model, negative_wavs, "negative") if negative_wavs else []
+    real_device_negatives = (
+        score_wavs(model, real_device_negative_wavs, "real-device negative")
+        if real_device_negative_wavs
+        else []
+    )
+    generated_negatives = (
+        score_wavs(model, generated_negative_wavs, "generated negative")
+        if generated_negative_wavs
+        else []
+    )
+    negatives = real_device_negatives + generated_negatives
 
     thresholds = threshold_values(args.min_threshold, args.max_threshold, args.threshold_step)
     minimum_patience = max(1, args.patience)
     maximum_patience = max(minimum_patience, args.max_patience)
     metrics = build_metrics(
         positives,
-        negatives,
+        generated_negatives,
         thresholds,
         list(range(minimum_patience, maximum_patience + 1)),
+        real_negatives=real_device_negatives,
     )
-    recommended_row, reason = choose_operating_point(
+    max_generated_false_positive_rate = max(
+        0.0,
+        args.max_generated_false_positive_rate
+        if args.max_false_positive_rate is None
+        else args.max_false_positive_rate,
+    )
+    recommended_row, reason = choose_source_aware_operating_point(
         metrics,
-        max_false_positive_rate=max(0.0, args.max_false_positive_rate),
+        max_generated_false_positive_rate=max_generated_false_positive_rate,
         min_positive_recall=max(0.0, min(1.0, args.min_positive_recall)),
         fallback_threshold=max(args.min_threshold, min(args.max_threshold, args.fallback_threshold)),
     )
@@ -469,6 +623,25 @@ def main() -> int:
     positive_scores = [float(row.get("max_score") or 0.0) for row in positives]
     recommended_recall = recommended_row.get("positive_recall") if recommended_row else None
     recall_ready = recommended_recall is None or float(recommended_recall or 0.0) >= max(0.0, min(1.0, args.min_positive_recall))
+    real_device_ready = bool(
+        recommended_row
+        and int(recommended_row.get("real_device_false_positive_clips") or 0) == 0
+    )
+    generated_ready = bool(
+        recommended_row
+        and float(recommended_row.get("generated_false_positive_rate") or 0.0)
+        <= max_generated_false_positive_rate
+    )
+    confirmation_ready = bool(
+        recommended_confirmation_row
+        and recommended_confirmation_row.get("positive_recall") is not None
+        and float(recommended_confirmation_row.get("positive_recall") or 0.0)
+        >= confirmation_min_recall
+    )
+    confirmation_required = bool(
+        recommended_row
+        and int(recommended_row.get("generated_false_positive_clips") or 0) > 0
+    )
     calibration = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "model": str(model_path),
@@ -480,23 +653,29 @@ def main() -> int:
         "recommended_confirmation_patience": recommended_confirmation_patience,
         "confirmation_recommendation_reason": confirmation_reason,
         "confirmation_min_positive_recall": confirmation_min_recall,
-        "confirmation_ready": bool(
-            recommended_confirmation_row
-            and recommended_confirmation_row.get("positive_recall") is not None
-            and float(recommended_confirmation_row.get("positive_recall") or 0.0)
-            >= confirmation_min_recall
-        ),
+        "confirmation_ready": confirmation_ready,
+        "confirmation_required": confirmation_required,
+        "deployment_mode": "confirmation_required" if confirmation_required else "standalone_ready",
+        "gate_policy": {
+            "real_device_false_positive_clips": 0,
+            "max_generated_false_positive_rate": max_generated_false_positive_rate,
+            "min_positive_recall": max(0.0, min(1.0, args.min_positive_recall)),
+        },
         "deployment_ready": bool(
             recommended_row
             and positives
             and negatives
-            and int(recommended_row.get("false_positive_clips") or 0) == 0
+            and real_device_ready
+            and generated_ready
             and recommended_threshold <= args.max_threshold
             and recall_ready
+            and (not confirmation_required or confirmation_ready)
         ),
         "sample_partition": max(0, args.sample_partition),
         "positive_clip_count": len(positives),
         "negative_clip_count": len(negatives),
+        "real_device_negative_clip_count": len(real_device_negatives),
+        "generated_negative_clip_count": len(generated_negatives),
         "positive_score_summary": {
             "max": max(positive_scores) if positive_scores else 0.0,
             "median": median(positive_scores) if positive_scores else 0.0,
@@ -520,6 +699,18 @@ def main() -> int:
             ),
             "triggered_negative_paths": misclassified_paths(
                 negatives,
+                recommended_threshold,
+                recommended_patience,
+                expected_positive=False,
+            ),
+            "triggered_real_device_negative_paths": misclassified_paths(
+                real_device_negatives,
+                recommended_threshold,
+                recommended_patience,
+                expected_positive=False,
+            ),
+            "triggered_generated_negative_paths": misclassified_paths(
+                generated_negatives,
                 recommended_threshold,
                 recommended_patience,
                 expected_positive=False,

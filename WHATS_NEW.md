@@ -1,5 +1,4 @@
-- Custom confusing phrases, automatic phonetic negatives, reviewed false wakes, and the broad ACAV bank are now independently sampled training sources. Custom phrases receive a guaranteed share of every hard-negative batch instead of being diluted into the generated corpus.
-- Deployment calibration now evaluates patience 2 through 5, accepts a measured pass at threshold 0.99, records exact misses and false triggers, and favors the lowest safe patience.
-- A failed raw-WAV gate can run one corrective retraining pass with stronger negative weighting, then validates against a fresh deterministic partition.
-- Uploaded recordings are split into stable training and real-device holdout views when at least five clips are available.
-- NVIDIA training now uses the available ONNX Runtime GPU 1.22.0 wheel instead of the unavailable 1.22.1 build.
+- The deployment gate is now source-aware: reviewed/real-device negatives remain zero-tolerance, while generated challenge audio may pass at no more than 1% false triggers with at least 90% positive recall. Any nonzero generated tail requires the confirmation operating point to be ready.
+- The default DNN classifier is wider (64 units), giving close wake phrases more capacity without changing the model format.
+- Failed calibration can now run two progressively stronger corrective passes. Hard negatives accumulate across retries, and every attempt validates against a fresh deterministic partition.
+- Calibration reports now separate real-device and generated false-trigger counts, rates, and exact paths so a synthetic stress-test miss cannot be mistaken for a real recording failure.

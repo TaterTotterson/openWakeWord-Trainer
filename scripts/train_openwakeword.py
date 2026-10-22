@@ -422,6 +422,24 @@ def stage_corrective_negative_clips(
     return _ordered_wavs(destination)
 
 
+def merge_corrective_negative_paths(
+    previous_paths: list[str],
+    calibration: dict[str, Any],
+) -> list[str]:
+    """Accumulate hard negatives across retries while preserving stable order."""
+    current_paths = list(
+        (calibration.get("misclassified") or {}).get("triggered_negative_paths") or []
+    )
+    merged: list[str] = []
+    seen: set[Path] = set()
+    for raw in previous_paths + current_paths:
+        path = Path(raw).expanduser().resolve()
+        if path not in seen:
+            seen.add(path)
+            merged.append(str(path))
+    return merged
+
+
 def make_config(args: argparse.Namespace, model_name: str, output_dir: Path) -> dict[str, Any]:
     data_dir = Path(args.data_dir).resolve()
     piper_dir = Path(args.piper_dir).resolve()
@@ -677,6 +695,8 @@ def run_calibration(
         str(report_path),
         "--min-positive-recall",
         str(args.calibration_min_positive_recall),
+        "--max-generated-false-positive-rate",
+        str(args.calibration_max_generated_false_positive_rate),
     ]
     for directory in positive_dirs:
         if directory.exists():
@@ -710,9 +730,13 @@ def build_corrective_retry(
     output_dir: Path,
     model_name: str,
     calibration: dict[str, Any],
+    *,
+    previous_triggered_paths: list[str] | None = None,
+    retry_number: int = 1,
 ) -> dict[str, Any] | None:
-    paths = list(
-        (calibration.get("misclassified") or {}).get("triggered_negative_paths") or []
+    paths = merge_corrective_negative_paths(
+        previous_triggered_paths or [],
+        calibration,
     )
     holdout_roots = [
         Path(value).resolve()
@@ -742,22 +766,42 @@ def build_corrective_retry(
 
     retry["feature_data_files"]["quality_retry_negative"] = str(feature_path)
     retry["batch_n_per_class"]["quality_retry_negative"] = min(
-        max(1, args.corrective_negative_batch),
+        max(
+            1,
+            int(
+                round(
+                    args.corrective_negative_batch
+                    * (
+                        1.0
+                        + max(0, retry_number - 1)
+                        * max(0.0, args.corrective_batch_multiplier - 1.0)
+                    )
+                )
+            ),
+        ),
         samples,
+    )
+    batch_multiplier = 1.0 + max(1, retry_number) * max(
+        0.0, args.corrective_batch_multiplier - 1.0
     )
     for key in ("adversarial_negative", "custom_negative"):
         if key in retry["batch_n_per_class"]:
             retry["batch_n_per_class"][key] = max(
                 1,
-                int(round(retry["batch_n_per_class"][key] * args.corrective_batch_multiplier)),
+                int(round(retry["batch_n_per_class"][key] * batch_multiplier)),
             )
+    weight_multiplier = 1.0 + max(1, retry_number) * max(
+        0.0, args.corrective_weight_multiplier - 1.0
+    )
     retry["max_negative_weight"] = max(
         3000,
-        int(round(float(retry.get("max_negative_weight") or 1500) * args.corrective_weight_multiplier)),
+        int(round(float(retry.get("max_negative_weight") or 1500) * weight_multiplier)),
     )
     retry["quality_retry"] = {
         "triggered_negative_paths": [str(path) for path in staged],
+        "source_triggered_negative_paths": paths,
         "source_sample_partition": int(calibration.get("sample_partition") or 0),
+        "retry_number": max(1, retry_number),
     }
     return retry
 
@@ -847,7 +891,11 @@ def main() -> int:
         help="Number of false-positive validation windows evaluated at once.",
     )
     parser.add_argument("--model-type", choices=("dnn", "rnn"), default="dnn")
-    parser.add_argument("--layer-size", type=int, default=32)
+    parser.add_argument(
+        "--layer-size",
+        type=int,
+        default=int(os.environ.get("OWW_DEFAULT_LAYER_SIZE", "64")),
+    )
     parser.add_argument("--target-accuracy", type=float, default=0.7)
     parser.add_argument("--target-recall", type=float, default=0.5)
     parser.add_argument("--target-fp-per-hour", type=float, default=float(os.environ.get("OWW_DEFAULT_TARGET_FP", "0.2")))
@@ -901,7 +949,12 @@ def main() -> int:
     parser.add_argument("--calibration-patience", type=int, default=int(os.environ.get("OWW_CALIBRATION_PATIENCE", "2")))
     parser.add_argument("--calibration-max-patience", type=int, default=int(os.environ.get("OWW_CALIBRATION_MAX_PATIENCE", "5")))
     parser.add_argument("--calibration-min-positive-recall", type=float, default=float(os.environ.get("OWW_CALIBRATION_MIN_RECALL", "0.90")))
-    parser.add_argument("--calibration-retries", type=int, default=int(os.environ.get("OWW_CALIBRATION_RETRIES", "1")))
+    parser.add_argument(
+        "--calibration-max-generated-false-positive-rate",
+        type=float,
+        default=float(os.environ.get("OWW_CALIBRATION_MAX_GENERATED_FP_RATE", "0.01")),
+    )
+    parser.add_argument("--calibration-retries", type=int, default=int(os.environ.get("OWW_CALIBRATION_RETRIES", "2")))
     parser.add_argument("--corrective-negative-batch", type=int, default=int(os.environ.get("OWW_CORRECTIVE_NEGATIVE_BATCH", "50")))
     parser.add_argument("--corrective-batch-multiplier", type=float, default=float(os.environ.get("OWW_CORRECTIVE_BATCH_MULTIPLIER", "1.5")))
     parser.add_argument("--corrective-weight-multiplier", type=float, default=float(os.environ.get("OWW_CORRECTIVE_WEIGHT_MULTIPLIER", "2.0")))
@@ -924,6 +977,8 @@ def main() -> int:
         raise SystemExit("--custom-negative-fraction must be between 0 and 1")
     if args.calibration_max_patience < args.calibration_patience:
         raise SystemExit("--calibration-max-patience cannot be lower than --calibration-patience")
+    if not 0.0 <= args.calibration_max_generated_false_positive_rate <= 1.0:
+        raise SystemExit("--calibration-max-generated-false-positive-rate must be between 0 and 1")
 
     model_name = safe_name(args.model_name or args.phrase)
     output_dir = Path(args.output_root).resolve() / model_name
@@ -1070,6 +1125,7 @@ def main() -> int:
         )
 
     retries_used = 0
+    cumulative_triggered_paths: list[str] = []
     while (
         onnx_path
         and calibration is not None
@@ -1082,12 +1138,20 @@ def main() -> int:
             output_dir,
             model_name,
             calibration,
+            previous_triggered_paths=cumulative_triggered_paths,
+            retry_number=retries_used + 1,
         )
         if retry_config is None:
             log("Calibration failed, but no eligible generated false triggers were available for retry")
             break
 
         retries_used += 1
+        cumulative_triggered_paths = list(
+            (retry_config.get("quality_retry") or {}).get(
+                "source_triggered_negative_paths"
+            )
+            or []
+        )
         history_dir = clip_root / "quality_attempts"
         history_dir.mkdir(parents=True, exist_ok=True)
         source_model = output_dir / f"{model_name}.onnx"
