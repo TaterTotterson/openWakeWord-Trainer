@@ -156,6 +156,49 @@ install_cuda_torch() {
     "torchaudio==${torch_version}+${torch_cuda}"
 }
 
+install_onnx_runtime() {
+  # The CPU and GPU wheels both install the same ``onnxruntime`` package.
+  # Uninstalling one after installing the other can therefore remove the
+  # shared module while leaving the selected wheel's metadata behind.
+  "$PY" -m pip uninstall -y onnxruntime onnxruntime-gpu >/dev/null 2>&1 || true
+  if [[ "$FEATURE_DEVICE" == "gpu" && "${OWW_FORCE_CPU:-0}" != "1" ]]; then
+    "$PY" -m pip install "onnxruntime-gpu==${ONNX_RUNTIME_VERSION}"
+  else
+    "$PY" -m pip install "onnxruntime==${ONNX_RUNTIME_VERSION}"
+  fi
+}
+
+onnx_runtime_ready() {
+  local expected_distribution unexpected_distribution
+  if [[ "$FEATURE_DEVICE" == "gpu" && "${OWW_FORCE_CPU:-0}" != "1" ]]; then
+    expected_distribution="onnxruntime-gpu"
+    unexpected_distribution="onnxruntime"
+  else
+    expected_distribution="onnxruntime"
+    unexpected_distribution="onnxruntime-gpu"
+  fi
+
+  "$PY" - "$expected_distribution" "$unexpected_distribution" "$ONNX_RUNTIME_VERSION" <<'PY' >/dev/null 2>&1
+import importlib.metadata as metadata
+import sys
+
+expected_distribution, unexpected_distribution, expected_version = sys.argv[1:]
+if metadata.version(expected_distribution) != expected_version:
+    raise SystemExit(1)
+try:
+    metadata.version(unexpected_distribution)
+except metadata.PackageNotFoundError:
+    pass
+else:
+    raise SystemExit(1)
+
+import onnxruntime as ort
+
+if expected_distribution == "onnxruntime-gpu" and "CUDAExecutionProvider" not in ort.get_available_providers():
+    raise SystemExit(1)
+PY
+}
+
 write_filtered_train_requirements() {
   local filtered="$VENV_DIR/requirements-train.no-torch.txt"
   "$PY" - "$ROOT_DIR/requirements-train.txt" "$filtered" <<'PY'
@@ -193,18 +236,18 @@ if [[ ! -f "$VENV_DIR/.train_deps_installed" || "$(cat "$VENV_DIR/.train_deps_ke
     "$PY" -m pip install -r requirements-train.txt
   fi
 
-  if [[ "$FEATURE_DEVICE" == "gpu" && "${OWW_FORCE_CPU:-0}" != "1" ]]; then
-    "$PY" -m pip uninstall -y onnxruntime onnxruntime-gpu >/dev/null 2>&1 || true
-    "$PY" -m pip install "onnxruntime-gpu==${ONNX_RUNTIME_VERSION}"
-  else
-    "$PY" -m pip uninstall -y onnxruntime-gpu >/dev/null 2>&1 || true
-    "$PY" -m pip install "onnxruntime==${ONNX_RUNTIME_VERSION}"
-  fi
+  install_onnx_runtime
 
   touch "$VENV_DIR/.train_deps_installed"
   printf "%s\n" "$TRAIN_DEPS_KEY" > "$VENV_DIR/.train_deps_key"
 else
   echo "Reusing existing training venv"
+fi
+
+if ! onnx_runtime_ready; then
+  echo "Repairing ONNX Runtime installation for ${FEATURE_DEVICE} feature extraction"
+  install_onnx_runtime
+  onnx_runtime_ready
 fi
 
 if ! "$PY" - <<'PY' >/dev/null 2>&1
