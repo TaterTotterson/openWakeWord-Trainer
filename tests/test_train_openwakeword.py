@@ -7,6 +7,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
@@ -21,6 +22,8 @@ from train_openwakeword import (  # noqa: E402
     make_config,
     merge_corrective_negative_paths,
     partition_uploaded_audio,
+    quarantine_existing_training_exports,
+    run_training_with_cpu_fallback,
     stage_corrective_negative_clips,
     stage_reviewed_negative_clips,
     stage_shared_positive_clips,
@@ -29,6 +32,78 @@ from train_openwakeword import (  # noqa: E402
 
 
 class ArtifactExportTests(unittest.TestCase):
+    def test_prior_onnx_is_quarantined_before_training(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "hey_tater"
+            output.mkdir()
+            model = output / "hey_tater.onnx"
+            sidecar = output / "weights.data"
+            model.write_bytes(b"old-model")
+            sidecar.write_bytes(b"old-weights")
+
+            quarantined = quarantine_existing_training_exports(model)
+
+            self.assertFalse(model.exists())
+            self.assertFalse(sidecar.exists())
+            self.assertEqual(
+                sorted(path.read_bytes() for path in quarantined),
+                [b"old-model", b"old-weights"],
+            )
+
+    def test_mps_failure_retries_on_cpu_and_requires_a_fresh_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp) / "hey_tater.onnx"
+            env = {"OWW_ENABLE_MPS": "1", "KEEP_ME": "yes"}
+            calls: list[dict[str, str]] = []
+
+            def fake_run(_cmd, env=None):
+                calls.append(dict(env or {}))
+                if len(calls) == 1:
+                    model.write_bytes(b"incomplete-mps-model")
+                    return types.SimpleNamespace(returncode=1)
+                self.assertFalse(model.exists())
+                model.write_bytes(b"fresh-cpu-model")
+                return types.SimpleNamespace(returncode=0)
+
+            with (
+                patch("train_openwakeword.sys.platform", "darwin"),
+                patch("train_openwakeword.run_process", side_effect=fake_run),
+            ):
+                run_training_with_cpu_fallback(
+                    ["python", "train.py"],
+                    env=env,
+                    expected_onnx=model,
+                )
+
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls[0]["OWW_ENABLE_MPS"], "1")
+            self.assertEqual(calls[1]["OWW_ENABLE_MPS"], "0")
+            self.assertEqual(calls[1]["CUDA_VISIBLE_DEVICES"], "")
+            self.assertEqual(env["OWW_ENABLE_MPS"], "0")
+            self.assertEqual(env["KEEP_ME"], "yes")
+            self.assertEqual(model.read_bytes(), b"fresh-cpu-model")
+
+    def test_failed_cpu_retry_cannot_publish_a_partial_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp) / "hey_tater.onnx"
+
+            def failed_run(_cmd, env=None):
+                model.write_bytes(b"partial")
+                return types.SimpleNamespace(returncode=1)
+
+            with (
+                patch("train_openwakeword.sys.platform", "darwin"),
+                patch("train_openwakeword.run_process", side_effect=failed_run),
+                self.assertRaises(SystemExit),
+            ):
+                run_training_with_cpu_fallback(
+                    ["python", "train.py"],
+                    env={"OWW_ENABLE_MPS": "1"},
+                    expected_onnx=model,
+                )
+
+            self.assertFalse(model.exists())
+
     def test_uploaded_audio_gets_a_stable_holdout_at_five_clips(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

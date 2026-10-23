@@ -34,16 +34,107 @@ def safe_name(raw: str) -> str:
     return text or "wakeword"
 
 
-def run(cmd: list[str], env: dict[str, str] | None = None, allow_onnx_failure: Path | None = None) -> None:
+def run_process(
+    cmd: list[str], env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess:
     log("")
     log("$ " + " ".join(cmd))
-    result = subprocess.run(cmd, cwd=str(ROOT_DIR), env=env)
-    if result.returncode == 0:
+    return subprocess.run(cmd, cwd=str(ROOT_DIR), env=env)
+
+
+def run(cmd: list[str], env: dict[str, str] | None = None) -> None:
+    result = run_process(cmd, env=env)
+    if result.returncode != 0:
+        raise SystemExit(result.returncode)
+
+
+def training_export_paths(expected_onnx: Path) -> list[Path]:
+    """Return model files that could make a failed attempt look successful."""
+    paths = [expected_onnx]
+    paths.extend(sorted(expected_onnx.parent.glob("*.data")))
+    return [path for path in paths if path.is_file()]
+
+
+def quarantine_existing_training_exports(expected_onnx: Path) -> list[Path]:
+    """Move prior exports aside so only this run can satisfy the model check."""
+    existing = training_export_paths(expected_onnx)
+    if not existing:
+        return []
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    history_dir = (
+        expected_onnx.parent
+        / expected_onnx.stem
+        / "quality_attempts"
+        / "preexisting"
+    )
+    history_dir.mkdir(parents=True, exist_ok=True)
+    quarantined: list[Path] = []
+    for path in existing:
+        destination = history_dir / f"{timestamp}-{path.name}"
+        shutil.move(str(path), str(destination))
+        quarantined.append(destination)
+        log(f"Preserved pre-existing training artifact: {destination}")
+    return quarantined
+
+
+def discard_training_exports(expected_onnx: Path) -> None:
+    """Remove incomplete exports before a clean retry or terminal failure."""
+    for path in training_export_paths(expected_onnx):
+        path.unlink(missing_ok=True)
+
+
+def cpu_training_environment(env: dict[str, str]) -> dict[str, str]:
+    cpu_env = dict(env)
+    cpu_env["CUDA_VISIBLE_DEVICES"] = ""
+    cpu_env["HIP_VISIBLE_DEVICES"] = ""
+    cpu_env["ROCR_VISIBLE_DEVICES"] = ""
+    cpu_env["OWW_ENABLE_MPS"] = "0"
+    cpu_env["OWW_PIPER_DEVICE"] = "cpu"
+    return cpu_env
+
+
+def run_training_with_cpu_fallback(
+    cmd: list[str],
+    *,
+    env: dict[str, str],
+    expected_onnx: Path,
+) -> None:
+    """Run training and retry once on CPU after an Apple MPS failure."""
+    discard_training_exports(expected_onnx)
+    result = run_process(cmd, env=env)
+    if result.returncode == 0 and expected_onnx.is_file():
         return
-    if allow_onnx_failure and allow_onnx_failure.exists():
-        log(f"WARNING: command exited {result.returncode}, but ONNX exists at {allow_onnx_failure}")
-        return
-    raise SystemExit(result.returncode)
+
+    mps_enabled = (
+        sys.platform == "darwin"
+        and env.get("OWW_ENABLE_MPS", "1").strip().lower()
+        not in {"0", "false", "no", "off"}
+    )
+    if mps_enabled:
+        if result.returncode == 0:
+            reason = "training exited successfully without producing a new ONNX model"
+        else:
+            reason = f"training exited {result.returncode}"
+        log(f"WARNING: Apple MPS {reason}; retrying this training pass once on CPU")
+        discard_training_exports(expected_onnx)
+        cpu_env = cpu_training_environment(env)
+        cpu_result = run_process(cmd, env=cpu_env)
+        if cpu_result.returncode == 0 and expected_onnx.is_file():
+            # Keep later corrective passes on the known-good CPU path instead
+            # of risking another Metal hang in the same training run.
+            env.update(cpu_env)
+            log("CPU retry completed and produced a fresh ONNX model")
+            return
+        discard_training_exports(expected_onnx)
+        if cpu_result.returncode != 0:
+            raise SystemExit(cpu_result.returncode)
+        raise SystemExit("CPU retry completed without producing an ONNX model")
+
+    discard_training_exports(expected_onnx)
+    if result.returncode != 0:
+        raise SystemExit(result.returncode)
+    raise SystemExit("Training completed without producing an ONNX model")
 
 
 def existing_wav_dir(path: Path) -> bool:
@@ -1102,10 +1193,11 @@ def main() -> int:
             run([sys.executable, str(train_py), "--training_config", str(config_path), "--augment_clips"], env=env)
 
         expected_onnx = output_dir / f"{model_name}.onnx"
-        run(
+        quarantine_existing_training_exports(expected_onnx)
+        run_training_with_cpu_fallback(
             [sys.executable, str(train_py), "--training_config", str(config_path), "--train_model"],
             env=env,
-            allow_onnx_failure=expected_onnx,
+            expected_onnx=expected_onnx,
         )
 
     expected_onnx = output_dir / f"{model_name}.onnx"
@@ -1173,10 +1265,10 @@ def main() -> int:
             f"negative weight={retry_config['max_negative_weight']}, "
             f"hard-negative batches={retry_config['batch_n_per_class']}"
         )
-        run(
+        run_training_with_cpu_fallback(
             [sys.executable, str(train_py), "--training_config", str(retry_path), "--train_model"],
             env=env,
-            allow_onnx_failure=source_model,
+            expected_onnx=source_model,
         )
         if not source_model.exists():
             raise SystemExit("openWakeWord corrective retry did not produce an ONNX model")
